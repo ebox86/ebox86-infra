@@ -1,0 +1,153 @@
+---
+# playbooks/32_configure_okd_network_and_storage.yml
+#
+# Configure the OKD network and storage infrastructure:
+#  - HAProxy load balancer on okd-lb VM
+#  - NFS persistent volume export on Proxmox (pve-01)
+#  - Internal DNS records for OKD nodes and VIPs in dns-01
+#
+# Prerequisites:
+#  - OKD infrastructure VMs provisioned (playbook 30)
+#  - Assisted installer deployed (playbook 31)
+#  - dns-01 VM is running and reachable
+#
+# Usage:
+#   ansible-playbook playbooks/32_configure_okd_network_and_storage.yml
+
+- name: Configure OKD network and storage infrastructure
+  hosts: all
+  become: true
+  vars_files:
+    - ../secrets/vault.yml
+
+  pre_tasks:
+    - name: Load OKD topology
+      ansible.builtin.include_vars:
+        file: ../vars/okd_topology.yml
+
+  tasks:
+    # Configure HAProxy on okd-lb
+    - name: Configure HAProxy load balancer
+      block:
+        - name: Check if this is the HAProxy VM
+          ansible.builtin.stat:
+            path: /etc/hostname
+          register: hostname_file
+
+        - name: Read hostname
+          ansible.builtin.slurp:
+            src: /etc/hostname
+          register: hostname_content
+
+        - name: Set haproxy host fact
+          ansible.builtin.set_fact:
+            is_haproxy: "{{ okd_haproxy.hostname in hostname_content.content | b64decode }}"
+
+        - name: Deploy HAProxy on this VM
+          block:
+            - name: Include HAProxy role
+              ansible.builtin.include_role:
+                name: okd_haproxy
+            
+            - name: Wait for HAProxy to stabilize
+              ansible.builtin.pause:
+                seconds: 5
+          when: is_haproxy | bool
+
+    # Configure NFS on Proxmox host (pve-01)
+    - name: Configure NFS persistent volume export
+      block:
+        - name: Check if this is Proxmox host
+          ansible.builtin.stat:
+            path: /etc/pve/nodes
+          register: proxmox_check
+
+        - name: Deploy NFS server on Proxmox
+          block:
+            - name: Include NFS server role
+              ansible.builtin.include_role:
+                name: okd_nfs_server
+            
+            - name: Wait for NFS to stabilize
+              ansible.builtin.pause:
+                seconds: 5
+          when: proxmox_check.stat.exists
+
+    # Update DNS records for OKD nodes via PowerDNS API
+    - name: Update OKD DNS records in dns-01 (PowerDNS)
+      block:
+        - name: Check if PowerDNS is running on dns-01
+          ansible.builtin.stat:
+            path: /opt/powerdns
+          register: _pdns_check
+
+        - name: Add OKD node records to PowerDNS (via API)
+          block:
+            - name: Add OKD A records to lab.ebox86.com zone
+              ansible.builtin.uri:
+                url: "http://localhost:8081/api/v1/servers/localhost/zones/{{ okd_cluster.name }}.{{ okd_cluster.domain }}."
+                method: PATCH
+                headers:
+                  X-API-Key: "{{ pdns_api_key }}"
+                  Content-Type: application/json
+                body_format: json
+                body:
+                  rrsets:
+                    - name: "{{ item.name }}"
+                      type: A
+                      ttl: 3600
+                      changetype: REPLACE
+                      records:
+                        - content: "{{ item.ip }}"
+                          disabled: false
+                status_code: 204
+              loop:
+                - { name: "{{ okd_control_plane.hostname }}.{{ okd_cluster.name }}.{{ okd_cluster.domain }}.", ip: "{{ okd_control_plane.ip }}" }
+                - { name: "{{ okd_workers[0].hostname }}.{{ okd_cluster.name }}.{{ okd_cluster.domain }}.", ip: "{{ okd_workers[0].ip }}" }
+                - { name: "{{ okd_workers[1].hostname }}.{{ okd_cluster.name }}.{{ okd_cluster.domain }}.", ip: "{{ okd_workers[1].ip }}" }
+                - { name: "api.{{ okd_cluster.name }}.{{ okd_cluster.domain }}.", ip: "{{ okd_api_vip }}" }
+                - { name: "*.apps.{{ okd_cluster.name }}.{{ okd_cluster.domain }}.", ip: "{{ okd_ingress_vip }}" }
+              loop_control:
+                label: "{{ item.name }} -> {{ item.ip }}"
+              failed_when: false
+              no_log: true
+          when: _pdns_check.stat.exists
+
+  post_tasks:
+    - name: Display OKD infrastructure summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          OKD network and storage infrastructure configured!
+          ============================================================
+          
+          HAProxy Load Balancer ({{ okd_haproxy.hostname }}):
+            - IP: {{ okd_haproxy.ip }}
+            - API endpoint: {{ okd_api_vip }}:6443
+            - Ingress HTTP: {{ okd_ingress_vip }}:80
+            - Ingress HTTPS: {{ okd_ingress_vip }}:443
+            - Stats: http://{{ okd_haproxy.ip }}:8404/stats
+          
+          NFS Persistent Volume Export (from pve-01):
+            - Path: {{ okd_nfs.export_path }}
+            - Server: {{ okd_nfs.nfs_server }}
+            - Client subnet: {{ okd_nfs.client_subnet }}
+            - Mount command: mount -t nfs {{ okd_nfs.nfs_server }}:{{ okd_nfs.export_path }} /mnt/okd-pv
+          
+          DNS Records (in dns-01 lab.ebox86.com zone):
+            - Control plane: {{ okd_control_plane.hostname }}.{{ okd_cluster.fqdn }} -> {{ okd_control_plane.ip }}
+            <!-- Worker nodes -->
+          {% for worker in okd_workers %}
+            - Worker: {{ worker.hostname }}.{{ okd_cluster.fqdn }} -> {{ worker.ip }}
+          {% endfor %}
+            - API VIP: api.{{ okd_cluster.name }}.{{ okd_cluster.domain }} -> {{ okd_api_vip }}
+            - Ingress VIP: *.apps.{{ okd_cluster.name }}.{{ okd_cluster.domain }} -> {{ okd_ingress_vip }}
+          
+          ============================================================
+          All OKD infrastructure is ready!
+          
+          Next steps:
+          1. Boot the OKD nodes with discovery ISOs (from assisted installer UI)
+          2. Watch the cluster bootstrap progress in the assisted installer UI
+          3. Once complete, run kubectl/oc commands against api.{{ okd_cluster.name }}.{{ okd_cluster.domain }}:6443
+          ============================================================

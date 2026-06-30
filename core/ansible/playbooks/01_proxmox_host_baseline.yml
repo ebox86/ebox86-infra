@@ -1,0 +1,15 @@
+---
+# playbooks/01_proxmox_host_baseline.yml
+#
+# Run this first, right after Proxmox finishes installing — uses root SSH
+# only, no API token required. Switches off the enterprise repo, installs
+# libguestfs-tools, caps ZFS ARC.
+#
+# Usage:
+#   ansible-playbook -i inventory/production/hosts.yml playbooks/01_proxmox_host_baseline.yml
+
+- name: Apply baseline config to Proxmox host(s)
+  hosts: proxmox
+  become: true
+  roles:
+    - proxmox_host_baseline

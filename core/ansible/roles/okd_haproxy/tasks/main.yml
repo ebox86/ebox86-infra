@@ -1,0 +1,85 @@
+---
+# roles/okd_haproxy/tasks/main.yml
+#
+# Configure HAProxy as the load balancer for OKD API (6443) and ingress (80/443).
+# Routes traffic to the control plane and worker nodes.
+
+- name: Install HAProxy
+  ansible.builtin.apt:
+    name:
+      - haproxy
+      - haproxy-doc
+    state: present
+    update_cache: yes
+
+- name: Create HAProxy configuration directory
+  ansible.builtin.file:
+    path: /etc/haproxy/certs.d
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy TLS certificate for HAProxy (from Proxmox Let's Encrypt cert)
+  ansible.builtin.copy:
+    src: /etc/pve/nodes/pve-01/pveproxy-ssl.pem
+    dest: /etc/haproxy/certs.d/okd-ingress.pem
+    mode: '0600'
+    owner: root
+    group: root
+    remote_src: yes
+  failed_when: false  # Cert may not exist on HAProxy VM, use self-signed as fallback
+
+- name: Generate self-signed certificate if needed (fallback)
+  ansible.builtin.shell: |
+    openssl req -x509 -newkey rsa:2048 -keyout /tmp/key.pem -out /tmp/cert.pem -days 365 -nodes \
+      -subj "/CN=*.apps.lab.ebox86.com"
+    cat /tmp/cert.pem /tmp/key.pem > /etc/haproxy/certs.d/okd-ingress.pem
+    chmod 600 /etc/haproxy/certs.d/okd-ingress.pem
+  args:
+    creates: /etc/haproxy/certs.d/okd-ingress.pem
+
+- name: Generate HAProxy configuration
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    mode: '0644'
+    backup: yes
+  notify: restart haproxy
+
+- name: Enable and start HAProxy
+  ansible.builtin.systemd:
+    name: haproxy
+    enabled: yes
+    state: started
+
+- name: Verify HAProxy is listening on API port
+  ansible.builtin.wait_for:
+    host: "{{ okd_haproxy.ip }}"
+    port: "{{ okd_haproxy.api_port }}"
+    timeout: 30
+    state: started
+
+- name: Display HAProxy status
+  ansible.builtin.debug:
+    msg: |
+      HAProxy is running on {{ okd_haproxy.ip }}
+      
+      API Load Balancer: {{ okd_api_vip }}:{{ okd_haproxy.api_port }}
+      Ingress HTTP: {{ okd_ingress_vip }}:{{ okd_haproxy.ingress_http_port }}
+      Ingress HTTPS: {{ okd_ingress_vip }}:{{ okd_haproxy.ingress_https_port }}
+      
+      Backends (will be populated once nodes are up):
+      - okd-control-0 ({{ okd_control_plane.ip }}:6443 for API)
+      - okd-worker-0 ({{ okd_workers[0].ip }})
+      - okd-worker-1 ({{ okd_workers[1].ip }})
+
+- name: Create handlers file
+  ansible.builtin.copy:
+    dest: /etc/haproxy/.handlers
+    content: |
+      # HAProxy handlers (included in main playbook)
+      - name: restart haproxy
+        ansible.builtin.systemd:
+          name: haproxy
+          state: restarted

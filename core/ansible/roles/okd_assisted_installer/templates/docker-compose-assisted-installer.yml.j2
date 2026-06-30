@@ -1,0 +1,117 @@
+version: "3.9"
+
+services:
+  assisted-db:
+    image: "quay.io/sclorg/postgresql-13-c9s:latest"
+    container_name: assisted-db
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - POSTGRESQL_ADMIN_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRESQL_USER=admin
+      - POSTGRESQL_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRESQL_DATABASE=assisted-service
+    volumes:
+      - "assisted-db-data:/var/lib/pgsql/data"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "admin", "-d", "assisted-service"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: "quay.io/minio/minio:latest"
+    container_name: assisted-minio
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - "minio-data:/data"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  createbuckets:
+    image: "quay.io/minio/mc:latest"
+    container_name: assisted-createbuckets
+    network_mode: host
+    restart: "on-failure"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
+    entrypoint: ["/bin/sh", "-c", "mc alias set local http://127.0.0.1:9000 minioadmin $MINIO_PASSWORD && mc mb local/assisted-service --ignore-existing"]
+
+  assisted-image-service:
+    image: "quay.io/edge-infrastructure/assisted-image-service:latest"
+    container_name: assisted-image-service
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - LISTEN_PORT=8888
+      - ASSISTED_SERVICE_SCHEME=http
+      - ASSISTED_SERVICE_HOST=127.0.0.1:8090
+      - ASSISTED_SERVICE_PORT=8090
+      - VERSIONS_TO_SERVE=
+      - OS_IMAGES=[{"openshift_version":"4.22","cpu_architecture":"x86_64","url":"https://rhcos.mirror.openshift.com/art/storage/prod/streams/c10s/builds/10.0.20251103-0/x86_64/scos-10.0.20251103-0-live-iso.x86_64.iso","version":"10.0.20251103-0"}]
+    volumes:
+      - "iso-cache-data:/data"
+
+  assisted-service:
+    image: "quay.io/edge-infrastructure/assisted-service:latest"
+    container_name: assisted-service
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - LISTEN_PORT=8090
+      - LOG_LEVEL=info
+      - DB_HOST=127.0.0.1
+      - DB_PORT=5432
+      - DB_USER=admin
+      - DB_PASS=${POSTGRES_PASSWORD}
+      - DB_NAME=assisted-service
+      - DEPLOY_TARGET=onprem
+      - AUTH_TYPE=none
+      - SERVICE_BASE_URL=http://{{ okd_assisted_installer.ip }}:8090
+      - IMAGE_SERVICE_BASE_URL=http://{{ okd_assisted_installer.ip }}:8888
+      - S3_ENDPOINT_URL=http://127.0.0.1:9000
+      - S3_BUCKET=assisted-service
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=${MINIO_PASSWORD}
+      - AWS_REGION=us-east-1
+      - S3_USE_SSL=false
+      - OS_IMAGES=[{"openshift_version":"4.22","cpu_architecture":"x86_64","url":"https://rhcos.mirror.openshift.com/art/storage/prod/streams/c10s/builds/10.0.20251103-0/x86_64/scos-10.0.20251103-0-live-iso.x86_64.iso","version":"10.0.20251103-0"}]
+      - RELEASE_IMAGES=[{"openshift_version":"4.22","cpu_architecture":"x86_64","url":"quay.io/okd/scos-release:4.22.0-okd-scos.4","version":"4.22.0-okd-scos.4","default":true}]
+      - HW_VALIDATOR_REQUIREMENTS=[{"version":"4.22.0-okd-scos.4","master":{"cpu_cores":4,"ram_mib":10240,"disk_size_gb":100,"installation_disk_speed_threshold_ms":10},"worker":{"cpu_cores":2,"ram_mib":8192,"disk_size_gb":100,"installation_disk_speed_threshold_ms":10},"sno":{"cpu_cores":8,"ram_mib":10240,"disk_size_gb":100,"installation_disk_speed_threshold_ms":10}}]
+    depends_on:
+      assisted-db:
+        condition: service_healthy
+      assisted-image-service:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    volumes:
+      - "/var/lib/assisted:/var/lib/assisted"
+
+  ui:
+    image: "quay.io/edge-infrastructure/assisted-installer-ui:latest"
+    container_name: assisted-ui
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - API_BASE_URL=http://{{ okd_assisted_installer.ip }}:8090
+      - PORT=8080
+      - LISTEN_PORT=8080
+    depends_on:
+      - assisted-service
+
+volumes:
+  assisted-db-data:
+  iso-cache-data:
+  minio-data:

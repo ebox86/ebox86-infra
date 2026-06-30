@@ -1,0 +1,40 @@
+---
+# roles/node_exporter/tasks/main.yml
+#
+# Installs prometheus-node-exporter from the distro package on Debian-based hosts.
+# Exposes host metrics on port 9100 for scraping by the OKD monitoring Prometheus.
+
+- name: Install prometheus-node-exporter
+  ansible.builtin.apt:
+    name: prometheus-node-exporter
+    state: present
+    update_cache: true
+
+- name: Configure node_exporter listen address and port
+  ansible.builtin.lineinfile:
+    path: /etc/default/prometheus-node-exporter
+    regexp: '^ARGS='
+    line: 'ARGS="--web.listen-address={{ node_exporter_listen_address }}:{{ node_exporter_port }}"'
+    create: true
+  register: _node_exporter_config
+
+- name: Enable and start prometheus-node-exporter
+  ansible.builtin.systemd:
+    name: prometheus-node-exporter
+    enabled: true
+    state: started
+
+- name: Restart node_exporter if config changed
+  ansible.builtin.systemd:
+    name: prometheus-node-exporter
+    state: restarted
+  when: _node_exporter_config.changed
+
+- name: Verify node_exporter is responding
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ node_exporter_port }}/metrics"
+    status_code: 200
+  register: _check
+  retries: 5
+  delay: 3
+  until: _check.status == 200

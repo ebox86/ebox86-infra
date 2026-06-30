@@ -1,0 +1,95 @@
+---
+# playbooks/14_configure_dns_sso.yml
+#
+# Enables Okta OIDC SSO on the PowerAdmin container running on dns-01.
+#
+# What this does:
+#   - Renders the updated docker-compose.yml with OIDC env vars
+#   - Recreates the poweradmin container to pick up new env (pdns-auth and
+#     pdns-recursor are untouched — only poweradmin is restarted)
+#   - Verifies PowerAdmin responds and the OIDC login link is present
+#
+# Prerequisites:
+#   1. Create an Okta OIDC app for PowerAdmin:
+#        Sign-in redirect URI:  https://dns-01.ebox86.com/oidc/callback
+#        Sign-out redirect URI: https://dns-01.ebox86.com
+#        Groups claim on ID token (add to Okta auth server if not already global)
+#        Assign devops-admin and devops-readers groups to the app
+#   2. Fill in vars/sso.yml:
+#        pdns_admin_sso.client_id: "<client ID from Okta>"
+#   3. Add to secrets/vault.yml (edit manually with ansible-vault edit):
+#        pdns_admin_oidc_client_secret: "<client secret from Okta>"
+#        pdns_admin_session_key: "<run: openssl rand -hex 32>"
+#
+# Usage:
+#   ansible-playbook playbooks/14_configure_dns_sso.yml \
+#     --vault-password-file ~/.vault_pass.txt
+
+- name: Enable Okta OIDC SSO on PowerAdmin
+  hosts: dns_servers
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../vars/sso.yml
+    - ../vars/network_topology.yml
+    - ../secrets/vault.yml
+
+  pre_tasks:
+    - name: Verify client_id is set
+      ansible.builtin.assert:
+        that:
+          - pdns_admin_sso.client_id | default('') | length > 0
+          - pdns_admin_oidc_client_secret is defined
+          - pdns_admin_oidc_client_secret | length > 0
+          - pdns_admin_session_key is defined
+          - pdns_admin_session_key | length > 0
+        fail_msg: >
+          pdns_admin_sso.client_id must be set in vars/sso.yml and
+          pdns_admin_oidc_client_secret + pdns_admin_session_key must be
+          in secrets/vault.yml before running this playbook.
+
+  tasks:
+    - name: Render updated docker-compose.yml with OIDC env vars
+      ansible.builtin.template:
+        src: ../roles/dns_server/templates/docker-compose.yml.j2
+        dest: /opt/powerdns/docker-compose.yml
+        mode: '0644'
+      register: _compose_file
+
+    - name: Recreate poweradmin container with new env vars
+      ansible.builtin.command: docker compose up -d --no-deps --force-recreate poweradmin
+      args:
+        chdir: /opt/powerdns
+      register: _recreate
+
+    - name: Wait for PowerAdmin to respond
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:8082/"
+        status_code: 200
+        return_content: true
+      register: _pa_check
+      until: _pa_check.status == 200
+      retries: 12
+      delay: 5
+
+    - name: Verify OIDC login link is present in response
+      ansible.builtin.assert:
+        that:
+          - "'oidc' in _pa_check.content | lower or 'openid' in _pa_check.content | lower or 'login' in _pa_check.content | lower"
+        fail_msg: "PowerAdmin responded but OIDC indicator not found — check container logs: docker logs poweradmin"
+
+    - name: Show SSO summary
+      ansible.builtin.debug:
+        msg: |
+          PowerAdmin OIDC SSO configured!
+
+          URL           : {{ pdns_admin_sso.application_url }}
+          OIDC provider : {{ okta_issuer_url }}
+          Callback URL  : {{ pdns_admin_sso.application_url }}/oidc/callback
+
+          Group → Permission template:
+            {{ pdns_admin_sso.admin_group_okta }}   → Administrator (ID {{ pdns_admin_sso.admin_template_id }})
+            {{ pdns_admin_sso.readers_group_okta }} → Viewer (ID {{ pdns_admin_sso.readers_template_id }})
+
+          Login flow:
+            https://dns-01.{{ search_domain }} → click "Login with OIDC" → Okta → PowerAdmin

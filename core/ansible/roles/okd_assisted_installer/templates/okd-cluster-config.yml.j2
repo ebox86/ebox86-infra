@@ -1,0 +1,66 @@
+# OKD Cluster Configuration Template
+# Use this as reference when configuring the cluster in the Assisted Installer UI
+# This is NOT automatically applied - UI configuration is manual
+
+cluster:
+  name: "{{ okd_cluster.name }}"
+  domain: "{{ okd_cluster.domain }}"
+  base_dns_domain: "{{ okd_cluster.domain }}"
+  api_vip: "{{ okd_api_vip }}"
+  ingress_vip: "{{ okd_ingress_vip }}"
+  high_availability_mode: "full"  # 3+ nodes
+  network_type: "{{ okd_cluster.network_type }}"
+  cluster_network_cidr: "{{ okd_cluster.cluster_network_cidr }}"
+  service_network_cidr: "{{ okd_cluster.service_network_cidr }}"
+  machine_network_cidr: "{{ okd_subnet }}"
+  openshift_version: "{{ okd_cluster.openshift_version }}"
+
+# Control plane node
+control_plane:
+  - hostname: "{{ okd_control_plane.hostname }}"
+    ip_address: "{{ okd_control_plane.ip }}"
+    mac_address: "WILL_BE_DISCOVERED"  # Populated during discovery ISO boot
+    role: "master"
+    cpu_count: "{{ okd_control_plane.cores }}"
+    memory_mb: "{{ okd_control_plane.memory_mb }}"
+    disk_gb: "{{ okd_control_plane.disk_gb }}"
+
+# Worker nodes (bare metal)
+workers:
+{% for worker in okd_workers %}
+  - hostname: "{{ worker.hostname }}"
+    ip_address: "{{ worker.ip }}"
+    mac_address: "WILL_BE_DISCOVERED"  # Populated during discovery ISO boot
+    role: "worker"
+    cpu_count: "{{ worker.cores }}"
+    memory_gb: "{{ worker.memory_gb }}"
+{% endfor %}
+
+# SSH key for cluster (required for Ignition configuration)
+ssh_public_key: |
+{% for line in lookup('file', okd_ssh_public_key_path).split('\n') %}
+  {{ line }}
+{% endfor %}
+
+# Proxy settings (if needed - leave empty for direct internet)
+proxy:
+  enabled: false
+  http_proxy: ""
+  https_proxy: ""
+  no_proxy: "127.0.0.1,localhost,.ebox86.com,10.0.0.0/8"
+
+# NFS for persistent volumes (created separately via Ansible)
+storage:
+  nfs_server: "{{ okd_nfs.nfs_server }}"
+  nfs_path: "{{ okd_nfs.export_path }}"
+  nfs_version: "{{ okd_nfs.nfs_version }}"
+
+# Operator customization (optional - defaults usually fine)
+operators: []
+
+# Additional cluster config
+scheduling:
+  master_nodes_scheduling: true  # Allow workloads on control plane
+
+# Pull secret (required for OKD - use barebones if no entitlement)
+pull_secret: '{"auths":{}}'  # Minimal pull secret for OKD

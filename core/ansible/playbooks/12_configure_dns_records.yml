@@ -1,0 +1,22 @@
+---
+# playbooks/12_configure_dns_records.yml
+#
+# Configures PowerDNS after playbook 11 has deployed the containers.
+# Creates the forward zone (ebox86.com), reverse zone (0.0.10.in-addr.arpa),
+# and manages A + PTR records from vars/network_topology.yml.
+#
+# Requires secrets/vault.yml:
+#   pdns_api_key
+#
+# Usage:
+#   ansible-playbook playbooks/12_configure_dns_records.yml \
+#     --vault-password-file ~/.vault_pass.txt
+
+- name: Configure PowerDNS zones and records
+  hosts: dns_servers
+  become: true
+  vars_files:
+    - ../vars/network_topology.yml
+    - ../secrets/vault.yml
+  roles:
+    - powerdns_config

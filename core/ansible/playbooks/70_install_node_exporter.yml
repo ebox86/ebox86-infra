@@ -1,0 +1,50 @@
+---
+# playbooks/70_install_node_exporter.yml
+#
+# Installs prometheus-node-exporter on all infra hosts so they can be scraped
+# by the Prometheus instance deployed in OKD (playbook 71).
+#
+# Targets: pve-01, dns-01, dhcp-01, cloudflared-01
+# Exposes: http://<host>:9100/metrics
+#
+# Usage:
+#   ansible-playbook playbooks/70_install_node_exporter.yml
+
+- name: Install node_exporter on infra hosts
+  hosts: monitoring_hosts
+  become: true
+  gather_facts: false
+  roles:
+    - node_exporter
+
+- name: Verify scrape targets are reachable from pve-01
+  hosts: pve-01
+  become: false
+  gather_facts: false
+  vars:
+    _targets:
+      - { host: "pve-01",        ip: "10.0.0.10" }
+      - { host: "dns-01",        ip: "10.20.0.20" }
+      - { host: "dhcp-01",       ip: "10.10.0.5" }
+      - { host: "cloudflared-01", ip: "10.20.0.30" }
+  tasks:
+    - name: Check node_exporter reachable on each host
+      ansible.builtin.uri:
+        url: "http://{{ item.ip }}:9100/metrics"
+        status_code: 200
+      loop: "{{ _targets }}"
+      loop_control:
+        label: "{{ item.host }} ({{ item.ip }}:9100)"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          node_exporter running on all infra hosts.
+
+          Scrape targets (port 9100):
+            pve-01         http://10.0.0.10:9100/metrics
+            dns-01         http://10.20.0.20:9100/metrics
+            dhcp-01        http://10.10.0.5:9100/metrics
+            cloudflared-01 http://10.20.0.30:9100/metrics
+
+          Next: ansible-playbook playbooks/71_deploy_okd_monitoring.yml

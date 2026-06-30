@@ -1,0 +1,219 @@
+---
+# playbooks/30_provision_okd_infra_vms.yml
+#
+# Provision the OKD infrastructure VMs on Proxmox:
+#  - okd-control-0: control plane node
+#  - okd-ai:        Assisted Installer orchestrator
+#  - okd-lb:        HAProxy load balancer
+#
+# All three are cloned from the golden template and configured with static
+# IPs in the 10.0.1.0/24 OKD subnet via cloud-init. A persistent route for
+# 10.0.1.0/24 is written to pve-01 so Ansible (and other hosts on 10.0.0.0/24)
+# can reach the OKD VMs after this playbook completes.
+#
+# Idempotent — skips clone/configure tasks if the VMID already exists.
+#
+# Prerequisites:
+#  - Golden template exists (VMID 9000)
+#  - SSH public key present at ssh_pubkey_local_path on the control machine
+#
+# Usage:
+#   ansible-playbook playbooks/30_provision_okd_infra_vms.yml
+
+- name: Provision OKD infrastructure VMs on Proxmox
+  hosts: proxmox
+  become: true
+  vars_files:
+    - ../secrets/vault.yml
+    - ../vars/okd_topology.yml
+  vars:
+    golden_template_vmid: 9000
+    ssh_pubkey_local_path: "~/.ssh/ebox86_ansible_ed25519.pub"
+    okd_vms:
+      - "{{ okd_control_plane }}"
+      - "{{ okd_assisted_installer }}"
+      - "{{ okd_haproxy }}"
+
+  tasks:
+
+    # --- SSH key -----------------------------------------------------------
+
+    - name: Copy SSH public key to pve-01 (qm set --sshkey needs a path on the host)
+      ansible.builtin.copy:
+        src: "{{ ssh_pubkey_local_path }}"
+        dest: /root/.ssh/okd_ansible_pubkey.pub
+        mode: '0644'
+
+    # --- Per-VM: clone + configure ----------------------------------------
+
+    - name: Check whether each OKD VM already exists
+      ansible.builtin.command: qm status {{ item.vmid }}
+      loop: "{{ okd_vms }}"
+      loop_control:
+        label: "{{ item.hostname }} ({{ item.vmid }})"
+      register: vm_existence
+      changed_when: false
+      failed_when: false
+
+    - name: Clone OKD VMs from golden template (skipped if VMID already exists)
+      ansible.builtin.command: >
+        qm clone {{ golden_template_vmid }} {{ item.item.vmid }}
+        --name {{ item.item.hostname }}
+        --full true
+        --storage {{ item.item.storage }}
+      loop: "{{ vm_existence.results }}"
+      loop_control:
+        label: "{{ item.item.hostname }} ({{ item.item.vmid }})"
+      when: item.rc != 0
+      register: clone_results
+      changed_when: true
+
+    - name: Wait for cloned VMs to appear in Proxmox
+      ansible.builtin.command: qm status {{ item.item.vmid }}
+      loop: "{{ vm_existence.results }}"
+      loop_control:
+        label: "{{ item.item.hostname }} ({{ item.item.vmid }})"
+      when: item.rc != 0
+      register: clone_wait
+      until: clone_wait.rc == 0
+      retries: 60
+      delay: 5
+
+    - name: Configure VM resources (cores, memory, CPU type)
+      ansible.builtin.command: >
+        qm set {{ item.vmid }}
+        --cores {{ item.cores }}
+        --memory {{ item.memory_mb }}
+        --cpu host
+        --onboot 1
+      loop: "{{ okd_vms }}"
+      loop_control:
+        label: "{{ item.hostname }} ({{ item.vmid }})"
+
+    - name: Configure cloud-init network (static IP + gateway)
+      ansible.builtin.command: >
+        qm set {{ item.vmid }}
+        --ipconfig0 ip={{ item.ip }}/24,gw={{ okd_gateway }}
+      loop: "{{ okd_vms }}"
+      loop_control:
+        label: "{{ item.hostname }} -> {{ item.ip }}"
+
+    - name: Configure cloud-init DNS and search domain
+      ansible.builtin.command: >
+        qm set {{ item.vmid }}
+        --nameserver "10.0.0.20 1.1.1.1"
+        --searchdomain lab.ebox86.com
+      loop: "{{ okd_vms }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+
+    - name: Configure cloud-init user and SSH key
+      ansible.builtin.command: >
+        qm set {{ item.vmid }}
+        --ciuser ansible
+        --sshkey /root/.ssh/okd_ansible_pubkey.pub
+      loop: "{{ okd_vms }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+
+    - name: Resize VM disk to match topology
+      ansible.builtin.command: >
+        qm resize {{ item.vmid }} scsi0 {{ item.disk_gb }}G
+      loop: "{{ okd_vms }}"
+      loop_control:
+        label: "{{ item.hostname }} -> {{ item.disk_gb }}G"
+      register: resize_result
+      failed_when:
+        - resize_result.rc != 0
+        - "'already' not in (resize_result.stderr | default(''))"
+      changed_when: resize_result.rc == 0
+
+    # --- Routing -----------------------------------------------------------
+    # pve-01 needs a route to 10.0.1.0/24 so Ansible on the control machine
+    # can reach OKD VMs (via pve-01 as a jump host, or directly if a route
+    # exists on the control machine as well).
+
+    - name: Write persistent OKD gateway config on pve-01 (10.0.1.1 on vmbr0 + NAT)
+      ansible.builtin.copy:
+        dest: /etc/network/interfaces.d/okd-gateway.cfg
+        content: |
+          # OKD subnet gateway — written by Ansible playbook 30
+          # Adds 10.0.1.1/24 to vmbr0 so OKD VMs can use pve-01 as their gateway.
+          # Masquerade lets OKD hosts reach the internet via pve-01's uplink.
+          up ip addr add 10.0.1.1/24 dev vmbr0 || true
+          up iptables -t nat -A POSTROUTING -s 10.0.1.0/24 ! -d 10.0.1.0/24 -j MASQUERADE || true
+          up iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -d 10.0.1.0/24 -j MASQUERADE || true
+          down ip addr del 10.0.1.1/24 dev vmbr0 || true
+          down iptables -t nat -D POSTROUTING -s 10.0.1.0/24 ! -d 10.0.1.0/24 -j MASQUERADE || true
+          down iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -d 10.0.1.0/24 -j MASQUERADE || true
+        mode: '0644'
+
+    - name: Apply OKD gateway IP on pve-01 immediately
+      ansible.builtin.command: ip addr add 10.0.1.1/24 dev vmbr0
+      register: gw_ip_result
+      changed_when: gw_ip_result.rc == 0
+      failed_when:
+        - gw_ip_result.rc != 0
+        - "'already' not in (gw_ip_result.stderr | default(''))"
+
+    - name: Apply masquerade rule for OKD subnet on pve-01 (OKD → internet)
+      ansible.builtin.iptables:
+        table: nat
+        chain: POSTROUTING
+        source: "10.0.1.0/24"
+        destination: "!10.0.1.0/24"
+        jump: MASQUERADE
+        state: present
+
+    - name: Apply masquerade rule for LAN → OKD (Mac/LAN hosts reach OKD subnet via pve-01)
+      ansible.builtin.iptables:
+        table: nat
+        chain: POSTROUTING
+        source: "10.0.0.0/24"
+        destination: "10.0.1.0/24"
+        jump: MASQUERADE
+        state: present
+
+    - name: Enable IPv4 forwarding on pve-01
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        state: present
+        sysctl_set: true
+        reload: true
+
+    # --- Start VMs ---------------------------------------------------------
+
+    - name: Start OKD VMs
+      ansible.builtin.command: qm start {{ item.vmid }}
+      loop: "{{ okd_vms }}"
+      loop_control:
+        label: "{{ item.hostname }} ({{ item.vmid }})"
+      register: start_result
+      failed_when:
+        - start_result.rc != 0
+        - "'already running' not in (start_result.stderr | default(''))"
+      changed_when: start_result.rc == 0
+
+    - name: Wait for SSH on each OKD VM
+      ansible.builtin.wait_for:
+        host: "{{ item.ip }}"
+        port: 22
+        delay: 15
+        timeout: 300
+      loop: "{{ okd_vms }}"
+      loop_control:
+        label: "{{ item.hostname }} ({{ item.ip }})"
+      delegate_to: localhost
+      become: false
+
+    - name: Display VM creation summary
+      ansible.builtin.debug:
+        msg: |
+          OKD infrastructure VMs are up and reachable via SSH.
+
+          Control plane:      {{ okd_control_plane.hostname }}  {{ okd_control_plane.ip }}  ({{ okd_control_plane.cores }} cores / {{ okd_control_plane.memory_mb }}MB)
+          Assisted Installer: {{ okd_assisted_installer.hostname }}  {{ okd_assisted_installer.ip }}  ({{ okd_assisted_installer.cores }} cores / {{ okd_assisted_installer.memory_mb }}MB)
+          HAProxy:            {{ okd_haproxy.hostname }}  {{ okd_haproxy.ip }}  ({{ okd_haproxy.cores }} cores / {{ okd_haproxy.memory_mb }}MB)
+
+          Next step: ansible-playbook playbooks/31_deploy_okd_assisted_installer.yml

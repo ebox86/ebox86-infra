@@ -1,0 +1,226 @@
+---
+# playbooks/31_configure_proxmox_sdn.yml
+#
+# Configures Proxmox SDN with a VLAN-aware bridge and VNets matching the
+# homelab VLAN scheme. VMs can then be attached to named VNets (e.g. "infra",
+# "okd") rather than raw VLAN IDs.
+#
+# What this does:
+#   1. Makes vmbr0 VLAN-aware (required for SDN VLAN zones)
+#   2. Creates SDN zone "homelab" (type: vlan, bridge: vmbr0)
+#   3. Creates one VNet per VLAN
+#   4. Applies the SDN config
+#
+# NOTE: pve-01 management IP (10.0.0.10) stays on VLAN 1 (untagged/native).
+# VLAN-aware mode adds tagging capability without removing the existing
+# management bridge config. ifreload -a applies the change live.
+#
+# Usage:
+#   ansible-playbook playbooks/31_configure_proxmox_sdn.yml
+
+- name: Configure Proxmox SDN — VLAN-aware bridge and VNets
+  hosts: proxmox
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../vars/network_vlans.yml
+    - ../vars/network_topology.yml
+    - ../secrets/vault.yml
+
+  tasks:
+
+    - name: Check current vmbr0 VLAN-aware status
+      ansible.builtin.shell: grep -c 'bridge-vlan-aware yes' /etc/network/interfaces
+      register: vlan_aware_check
+      failed_when: false
+      changed_when: false
+
+    - name: Enable VLAN-aware mode on vmbr0
+      ansible.builtin.lineinfile:
+        path: /etc/network/interfaces
+        insertafter: 'bridge-fd 0'
+        line: "\tbridge-vlan-aware yes"
+        state: present
+      register: vlan_aware_change
+      when: vlan_aware_check.stdout == "0"
+
+    - name: Remove stale OKD flat-bridge network configs (incompatible with VLAN-aware vmbr0)
+      ansible.builtin.file:
+        path: "/etc/network/interfaces.d/{{ item }}"
+        state: absent
+      loop:
+        - okd-gateway.cfg
+        - okd-route.cfg
+
+    - name: Fix vmbr0 gateway (10.0.0.1 → 10.0.0.254) and remove stale OKD post-up lines
+      ansible.builtin.replace:
+        path: /etc/network/interfaces
+        regexp: 'gateway 10\.0\.0\.1\b'
+        replace: 'gateway {{ gateway }}'
+      register: _gw_fix
+
+    - name: Remove stale OKD iptables/ip-addr post-up lines from /etc/network/interfaces
+      ansible.builtin.lineinfile:
+        path: /etc/network/interfaces
+        regexp: "{{ item }}"
+        state: absent
+      loop:
+        - 'post-up ip addr add 10\.0\.1\.'
+        - 'post-up echo 1 > /proc/sys/net/ipv4/ip_forward'
+        - 'post-up iptables -t nat .* 10\.0\.1\.'
+        - 'pre-down iptables -t nat .* 10\.0\.1\.'
+      register: _okd_lines_fix
+
+    - name: Apply network config change (ifreload — live, no reboot needed)
+      ansible.builtin.command: ifreload -a
+      when: vlan_aware_change is changed or _gw_fix is changed or _okd_lines_fix is changed
+
+    - name: Remove stale vmbr1.cfg from interfaces.d (vmbr1 now lives in main interfaces file)
+      ansible.builtin.file:
+        path: /etc/network/interfaces.d/vmbr1.cfg
+        state: absent
+
+    - name: Add vmbr1 VLAN-aware bridge to /etc/network/interfaces (visible in Proxmox UI)
+      ansible.builtin.blockinfile:
+        path: /etc/network/interfaces
+        marker: "# {mark} ANSIBLE MANAGED — vmbr1 VM data bridge"
+        insertbefore: '^source /etc/network/interfaces\.d'
+        block: |
+          auto vmbr1
+          iface vmbr1 inet manual
+                  bridge-ports nic1
+                  bridge-stp off
+                  bridge-fd 0
+                  bridge-vlan-aware yes
+
+          iface nic1 inet manual
+                  bridge-vids 10 20 30 40 50 60 70
+      register: _vmbr1_change
+
+    - name: Apply vmbr1 config (ifreload)
+      ansible.builtin.command: ifreload -a
+      when: _vmbr1_change is changed
+
+    - name: Deploy systemd service for persistent VLAN subnet routes
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vlan-routes.service
+        content: |
+          [Unit]
+          Description=Persistent VLAN subnet routes via homelab gateway
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/sh -c '\
+            for net in 10.10.0.0/24 10.20.0.0/24 10.30.0.0/24 \
+                       10.40.0.0/24 10.50.0.0/24 10.60.0.0/24 10.70.0.0/24; do \
+              ip route replace $net via {{ gateway }} dev vmbr0; \
+            done'
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: "0644"
+      register: _vlan_routes_svc
+
+    - name: Enable and start vlan-routes service
+      ansible.builtin.systemd:
+        name: vlan-routes
+        enabled: true
+        state: started
+        daemon_reload: "{{ _vlan_routes_svc is changed }}"
+
+    - name: Remove old homelab SDN zone if it still exists (one-time migration homelab -> lab)
+      ansible.builtin.command: pvesh delete /cluster/sdn/zones/homelab
+      register: _del_zone
+      failed_when: _del_zone.rc != 0 and 'does not exist' not in _del_zone.stderr
+      changed_when: _del_zone.rc == 0
+
+    - name: Register PowerDNS as Proxmox SDN DNS plugin
+      ansible.builtin.command: >
+        pvesh create /cluster/sdn/dns
+        --dns pdns
+        --type powerdns
+        --url http://{{ infra_hosts.dns_01.ip }}:8081/api/v1/servers/localhost
+        --key {{ pdns_api_key }}
+        --ttl 300
+      register: _pdns_plugin
+      failed_when: _pdns_plugin.rc != 0 and 'already defined' not in _pdns_plugin.stderr
+      changed_when: _pdns_plugin.rc == 0
+      no_log: true
+      tags: [dns_plugin]
+
+    - name: List existing SDN zones
+      ansible.builtin.command: pvesh get /cluster/sdn/zones --output-format json
+      register: existing_zones
+      changed_when: false
+      failed_when: false
+
+    - name: Create SDN VLAN zone ({{ proxmox_sdn.zone }})
+      ansible.builtin.command: >
+        pvesh create /cluster/sdn/zones
+        --zone {{ proxmox_sdn.zone }}
+        --type vlan
+        --bridge {{ proxmox_sdn.bridge }}
+      register: zone_create
+      failed_when: zone_create.rc != 0 and 'already defined' not in zone_create.stderr
+      changed_when: zone_create.rc == 0
+
+    - name: Update SDN zone DNS settings (idempotent — covers already-existing zone)
+      ansible.builtin.command: >
+        pvesh set /cluster/sdn/zones/{{ proxmox_sdn.zone }}
+        --dns pdns
+        --reversedns pdns
+        --dnszone {{ search_domain }}
+      changed_when: true
+      tags: [dns_plugin]
+
+    - name: List existing SDN VNets
+      ansible.builtin.command: pvesh get /cluster/sdn/vnets --output-format json
+      register: existing_vnets
+      changed_when: false
+      failed_when: false
+
+    - name: Create VNets for each VLAN
+      ansible.builtin.command: >
+        pvesh create /cluster/sdn/vnets
+        --vnet {{ item.name }}
+        --zone {{ proxmox_sdn.zone }}
+        --tag {{ item.vlan }}
+        --alias "{{ item.alias }}"
+      loop: "{{ proxmox_sdn.vnets }}"
+      loop_control:
+        label: "{{ item.name }} (VLAN {{ item.vlan }})"
+      register: vnet_create
+      failed_when: vnet_create.rc != 0 and 'already defined' not in vnet_create.stderr
+      changed_when: vnet_create.rc == 0
+
+    - name: Apply SDN configuration
+      ansible.builtin.command: pvesh set /cluster/sdn
+      changed_when: true
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg: |
+          Proxmox SDN configured.
+
+          Zone   : {{ proxmox_sdn.zone }} (type: vlan, bridge: {{ proxmox_sdn.bridge }})
+
+          VNets:
+          {% for v in proxmox_sdn.vnets %}
+            {{ v.name }}  VLAN {{ v.vlan }}  {{ v.alias }}
+          {% endfor %}
+
+          To assign a VM to a VLAN, set its NIC to bridge=vmbr0 and
+          select the appropriate VNet in Proxmox UI → VM → Hardware → Network.
+
+          PowerDNS SDN plugin: pdns -> http://{{ infra_hosts.dns_01.ip }}:8081
+          DNS zone: {{ search_domain }} (reverse mask: /24 per VLAN)
+          Proxmox will auto-register VM IPs as A/PTR records in PowerDNS.
+
+          Next steps:
+            - Verify VNets appear in Proxmox UI under Datacenter -> SDN -> VNets
+            - Deploy dns-01 (playbook 10) and PowerDNS (playbook 11) before
+              creating VMs so auto-DNS registration works
+            - Attach VMs to appropriate VNets

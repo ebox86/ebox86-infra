@@ -1,0 +1,121 @@
+---
+# OKD 4.x cluster topology and networking configuration
+# Hybrid setup: 1 control plane VM on Proxmox + 2 worker nodes on bare metal ml350s
+# Assisted Installer VM on Proxmox handles bootstrap orchestration
+
+# OKD cluster networking
+okd_subnet: 10.0.1.0/24
+okd_netmask: 255.255.255.0
+okd_gateway: 10.0.1.1
+
+# API and Ingress VIPs (load balancer targets via HAProxy)
+okd_api_vip: 10.0.1.5          # Kubernetes API (port 6443)
+okd_ingress_vip: 10.0.1.6       # OpenShift ingress (ports 80/443)
+
+# Control plane (runs on Proxmox VM)
+okd_control_plane:
+  hostname: okd-control-0
+  ip: 10.0.1.10
+  vmid: 200
+  cores: 4
+  memory_mb: 10240
+  disk_gb: 120
+  storage: local-zfs
+  role: "OKD control plane (1 node)"
+
+# Worker nodes (run on bare metal ml350s)
+okd_workers:
+  - hostname: okd-worker-0
+    ip: 10.0.1.20
+    storage_ip: 10.20.0.22    # eno1np0 VLAN 20 — NFS storage network
+    hardware: "ml350-01 (bare metal)"
+    cores: 16
+    memory_gb: 64
+    role: "OKD worker"
+  - hostname: okd-worker-1
+    ip: 10.0.1.21
+    storage_ip: 10.20.0.21    # eno1np0 VLAN 20 — NFS storage network
+    hardware: "ml350-02 (bare metal)"
+    cores: 16
+    memory_gb: 64
+    role: "OKD worker"
+
+# Assisted Installer (orchestrates cluster bootstrap, runs on Proxmox VM)
+okd_assisted_installer:
+  hostname: okd-ai
+  ip: 10.0.1.50
+  vmid: 201
+  cores: 4
+  memory_mb: 8192
+  disk_gb: 100
+  storage: local-zfs
+  ui_port: 8080
+  ui_url: "http://10.0.1.50:8080"
+  role: "OKD Assisted Installer orchestrator"
+
+# HAProxy load balancer (fronts API and ingress, runs on Proxmox VM)
+okd_haproxy:
+  hostname: okd-lb
+  ip: 10.0.1.7
+  vmid: 202
+  cores: 2
+  memory_mb: 4096
+  disk_gb: 50
+  storage: local-zfs
+  api_port: 6443
+  ingress_http_port: 80
+  ingress_https_port: 443
+  role: "OKD load balancer (HAProxy)"
+
+# NFS for OKD persistent volumes (export from Proxmox tank pool)
+okd_nfs:
+  export_path: "/tank/okd-pv"
+  export_size: 500GB  # Adjust based on tank capacity
+  client_subnets: ["10.0.1.0/24", "10.20.0.0/24"]  # OKD pod network + storage NIC network
+  nfs_server: "10.20.0.10"  # pve-01 VLAN 20 storage IP
+  nfs_version: "4.2"
+
+# OKD cluster configuration (used by assisted installer)
+okd_cluster:
+  name: "lab"
+  domain: "ebox86.com"
+  fqdn: "lab.ebox86.com"
+  openshift_version: "4.22"
+  network_type: "OVNKubernetes"  # or "SDN"
+  cluster_network_cidr: "10.128.0.0/14"
+  service_network_cidr: "172.30.0.0/16"
+  ingress_vip: "{{ okd_ingress_vip }}"
+  api_vip: "{{ okd_api_vip }}"
+
+# SSH key for OKD cluster (required for assisted installer)
+# This should be the Ansible SSH key, or generate a dedicated OKD key
+okd_ssh_public_key_path: "~/.ssh/ebox86_ansible_ed25519.pub"
+
+# Storage backend for OKD (NFS for this setup)
+okd_storage_class: "nfs"
+okd_storage_provisioner: "nfs-subdir-external-provisioner"
+
+# Alertmanager email receiver (used by playbook 40)
+# SMTP relay: Mailjet (in-v3.mailjet.com:587)
+# Credentials in vault: mailjet_api_key, mailjet_secret_key
+# Domain ebox86.com must be verified in Mailjet sender domains.
+okd_alerting:
+  email_to: "okd-alerts@ebox86.com"
+  email_from: "okd-alerts@ebox86.com"
+  smtp_host: "in-v3.mailjet.com:587"
+  smtp_username: "{{ mailjet_api_key }}"
+
+# Okta OIDC identity provider (used by playbook 40)
+# issuer_url: your Okta domain + /oauth2/default (or custom auth server)
+# callback_url is automatically: https://oauth-openshift.apps.{{ okd_cluster.fqdn }}/oauth2callback/okta
+okd_okta:
+  issuer_url: "{{ okta_issuer_url }}"
+  client_id: "0oa14dszk29aZtfa1698"
+  # Groups mirror the shared homelab Okta groups — same groups control access to
+  # Proxmox, PowerDNS Admin, and OKD. Manage membership in Okta; roles bind here.
+  # Roles: cluster-admin, cluster-reader, view, edit
+  groups:
+    - okta_group: "devops-admin"
+      role: cluster-admin
+    - okta_group: "devops-readers"
+      role: cluster-reader

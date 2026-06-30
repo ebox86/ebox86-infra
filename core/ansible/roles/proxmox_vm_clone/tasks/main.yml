@@ -1,0 +1,121 @@
+---
+# roles/proxmox_vm_clone/tasks/main.yml
+#
+# Clones a VM from the golden template, configures cores/memory/disk/
+# network/cloud-init, starts it, and waits for SSH to come up.
+# Idempotent — skips clone/configure if the target VMID already exists.
+#
+# Required vars (pass per-VM, typically from a playbook's vars block):
+#   vm_id, vm_name, vm_ip, vm_cidr, vm_cores, vm_memory_mb
+#   vm_storage           - Proxmox storage ID for this VM's disk
+#   ssh_pubkey_local_path - path to your SSH public key ON THE CONTROL
+#                           MACHINE (gets copied to pve-01, since qm set
+#                           --sshkey needs a path on the Proxmox host)
+# Uses from group_vars: template_vmid, proxmox_bridge, proxmox_node,
+#   gateway, upstream_dns, search_domain (network_topology.yml + proxmox.yml)
+
+- name: Check if target VM already exists
+  ansible.builtin.command: qm status {{ vm_id }}
+  register: vm_status_check
+  changed_when: false
+  failed_when: false
+
+- name: Set fact for whether VM already exists
+  ansible.builtin.set_fact:
+    vm_already_exists: "{{ vm_status_check.rc == 0 }}"
+
+- name: Clone the golden template
+  ansible.builtin.command: >
+    qm clone {{ template_vmid }} {{ vm_id }}
+    --name {{ vm_name }}
+    --full true
+    --storage {{ vm_storage }}
+  when: not vm_already_exists
+
+- name: Configure clone — cores, memory
+  ansible.builtin.command: >
+    qm set {{ vm_id }}
+    --cores {{ vm_cores }}
+    --memory {{ vm_memory_mb }}
+  when: not vm_already_exists
+
+- name: Configure clone — network bridge
+  ansible.builtin.command: >
+    qm set {{ vm_id }}
+    --net0 virtio,bridge={{ proxmox_bridge }}
+  when: not vm_already_exists
+
+- name: Configure clone — cloud-init network (static IP)
+  ansible.builtin.command: >
+    qm set {{ vm_id }}
+    --ipconfig0 ip={{ vm_ip }}/{{ vm_cidr }},gw={{ gateway }}
+  when: not vm_already_exists
+
+- name: Configure clone — cloud-init DNS
+  ansible.builtin.command: >
+    qm set {{ vm_id }}
+    --nameserver "{{ upstream_dns | join(' ') }}"
+    --searchdomain {{ search_domain }}
+  when: not vm_already_exists
+
+- name: Configure VM autostart on host boot (and startup order/delay if specified)
+  ansible.builtin.command: >
+    qm set {{ vm_id }}
+    --onboot 1
+    {{ '--startup order=' + (vm_startup_order | string) if vm_startup_order is defined else '' }}
+    {{ ',up=' + (vm_startup_delay | string) if vm_startup_delay is defined else '' }}
+
+- name: Copy SSH public key from control machine to pve-01 (qm set --sshkey needs a path ON pve-01)
+  ansible.builtin.copy:
+    src: "{{ ssh_pubkey_local_path }}"
+    dest: "/root/.ssh/ansible_pubkey_for_clones.pub"
+    mode: '0644'
+
+- name: Configure clone — cloud-init user and SSH key
+  ansible.builtin.command: >
+    qm set {{ vm_id }}
+    --ciuser {{ vm_ciuser | default('ansible') }}
+    --sshkey /root/.ssh/ansible_pubkey_for_clones.pub
+  when: not vm_already_exists
+
+- name: Re-apply SSH key on an EXISTING VM (requires STOP + START, not just reboot, to take effect)
+  ansible.builtin.command: >
+    qm set {{ vm_id }}
+    --sshkey /root/.ssh/ansible_pubkey_for_clones.pub
+  register: sshkey_reapply
+  when: vm_already_exists
+
+- name: Inform user a full stop/start is needed for the re-applied SSH key to take effect
+  ansible.builtin.debug:
+    msg: >
+      SSH key config updated for existing VM '{{ vm_name }}' (VMID
+      {{ vm_id }}) — the cloud-init config is delivered via an ISO that
+      is only regenerated on a full STOP + START, not a simple reboot
+      (confirmed via Proxmox forum: a soft reboot does not regenerate
+      the cloud-init ISO). Run: qm stop {{ vm_id }} && qm start {{ vm_id }}
+      — or, for zero risk, just append the key directly to
+      ~/.ssh/authorized_keys on the VM over SSH instead (safer than
+      risking a lockout if the stop/start doesn't behave as expected).
+  when: vm_already_exists and sshkey_reapply.changed
+
+- name: Start the VM
+  ansible.builtin.command: qm start {{ vm_id }}
+  register: vm_start_result
+  failed_when:
+    - vm_start_result.rc != 0
+    - "'already running' not in vm_start_result.stderr"
+
+- name: Wait for SSH to become available on the new VM
+  ansible.builtin.wait_for:
+    host: "{{ vm_ip }}"
+    port: 22
+    delay: 10
+    timeout: 180
+  delegate_to: localhost
+  become: false
+
+- name: Inform user the VM is up
+  ansible.builtin.debug:
+    msg: >
+      VM '{{ vm_name }}' (VMID {{ vm_id }}) is running at {{ vm_ip }}
+      and accepting SSH connections.

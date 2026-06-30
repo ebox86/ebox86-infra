@@ -1,0 +1,62 @@
+---
+# roles/okd_nfs_server/tasks/main.yml
+#
+# Configure NFS export from Proxmox for OKD persistent volumes.
+# Runs on pve-01 (Proxmox host).
+
+- name: Install NFS server packages
+  ansible.builtin.apt:
+    name:
+      - nfs-kernel-server
+      - nfs-common
+    state: present
+    update_cache: yes
+
+- name: Create OKD persistent volume directory on tank pool
+  ansible.builtin.file:
+    path: "{{ okd_nfs.export_path }}"
+    state: directory
+    mode: '0777'
+    owner: nobody
+    group: nogroup
+
+- name: Add NFS export to /etc/exports
+  ansible.builtin.lineinfile:
+    path: /etc/exports
+    regexp: "^{{ okd_nfs.export_path }}"
+    line: "{{ okd_nfs.export_path }} {{ okd_nfs.client_subnet }}(rw,sync,no_subtree_check,no_root_squash)"
+    state: present
+  notify: reload nfs server
+
+- name: Enable and start NFS server
+  ansible.builtin.systemd:
+    name: nfs-server
+    enabled: yes
+    state: started
+
+- name: Export NFS shares
+  ansible.builtin.shell: exportfs -ra
+  changed_when: false
+
+- name: Verify NFS export is active
+  ansible.builtin.shell: showmount -e localhost
+  register: nfs_exports
+  changed_when: false
+
+- name: Display NFS export information
+  ansible.builtin.debug:
+    msg: |
+      NFS export created for OKD persistent volumes:
+      
+      {{ nfs_exports.stdout }}
+      
+      Mount point: {{ okd_nfs.export_path }}
+      Export size: {{ okd_nfs.export_size }}
+      Client subnet: {{ okd_nfs.client_subnet }}
+      NFS server IP: {{ okd_nfs.nfs_server }}
+      
+      OKD nodes will mount this as:
+      nfs://{{ okd_nfs.nfs_server }}:{{ okd_nfs.export_path }}
+      
+      Subdirectories will be created automatically by the NFS provisioner.
+

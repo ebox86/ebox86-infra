@@ -1,0 +1,72 @@
+# HAProxy configuration for OKD cluster
+# Fronts the API (6443) and ingress controllers (80/443)
+
+global
+  log stdout local0
+  log stdout local1 notice
+  chroot /var/lib/haproxy
+  stats socket /var/run/haproxy/admin.sock mode 660 level admin
+  stats timeout 30s
+  user haproxy
+  group haproxy
+  daemon
+  maxconn 4096
+
+defaults
+  log     global
+  mode    tcp
+  option  tcplog
+  option  dontlognull
+  timeout connect 5000
+  timeout client  50000
+  timeout server  50000
+
+# API Load Balancer (6443 -> control plane)
+frontend okd_api
+  bind {{ okd_api_vip }}:{{ okd_haproxy.api_port }}
+  mode tcp
+  option tcplog
+  default_backend okd_api_backend
+
+backend okd_api_backend
+  mode tcp
+  balance roundrobin
+  option tcp-check
+  # Control plane node
+  server okd-control-0 {{ okd_control_plane.ip }}:6443 check inter 5s fall 2 rise 2
+  # Workers also participate in API (HA)
+{% for worker in okd_workers %}
+  server {{ worker.hostname }} {{ worker.ip }}:6443 check inter 5s fall 2 rise 2
+{% endfor %}
+
+# Ingress HTTPS Load Balancer (443 -> ingress controller)
+frontend okd_ingress_https
+  bind {{ okd_ingress_vip }}:{{ okd_haproxy.ingress_https_port }}
+  mode tcp
+  option tcplog
+  default_backend okd_ingress_backend
+
+# Ingress HTTP Load Balancer (80 -> ingress controller, redirects to HTTPS)
+frontend okd_ingress_http
+  bind {{ okd_ingress_vip }}:{{ okd_haproxy.ingress_http_port }}
+  mode tcp
+  option tcplog
+  default_backend okd_ingress_backend
+
+backend okd_ingress_backend
+  mode tcp
+  balance roundrobin
+  option tcp-check
+  # All nodes (control + workers) run ingress
+  server okd-control-0 {{ okd_control_plane.ip }}:443 check inter 5s fall 2 rise 2
+{% for worker in okd_workers %}
+  server {{ worker.hostname }} {{ worker.ip }}:443 check inter 5s fall 2 rise 2
+{% endfor %}
+
+# Stats page (optional, for debugging)
+listen stats
+  bind {{ okd_haproxy.ip }}:8404
+  stats enable
+  stats uri /stats
+  stats refresh 30s
+  stats admin if TRUE

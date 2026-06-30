@@ -1,0 +1,76 @@
+services:
+  pdns-auth:
+    image: powerdns/pdns-auth-49:latest
+    container_name: pdns-auth
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5300:53/udp"   # Auth DNS — loopback only, recursor forwards here
+      - "127.0.0.1:5300:53/tcp"
+      - "8081:8081/tcp"            # REST API (Proxmox SDN plugin + Ansible)
+    volumes:
+      - ./auth/pdns.conf:/etc/powerdns/pdns.conf:ro
+      - ./auth/data:/var/lib/powerdns
+    networks:
+      pdns:
+        ipv4_address: 172.20.0.10
+
+  pdns-recursor:
+    image: powerdns/pdns-recursor-51:latest
+    container_name: pdns-recursor
+    restart: unless-stopped
+    ports:
+      - "53:53/udp"    # Client-facing DNS resolver
+      - "53:53/tcp"
+    volumes:
+      - ./recursor/recursor.conf:/etc/powerdns/recursor.conf:ro
+    depends_on:
+      - pdns-auth
+    networks:
+      - pdns
+
+  poweradmin:
+    image: poweradmin/poweradmin:latest
+    container_name: poweradmin
+    restart: unless-stopped
+    ports:
+      - "8082:80"
+    environment:
+      - DB_TYPE=sqlite
+      - DB_FILE=/var/lib/powerdns/pdns.sqlite3
+      - DNS_NS1=dns-01.{{ search_domain }}
+      - DNS_NS2=dns-01.{{ search_domain }}
+      - DNS_HOSTMASTER=hostmaster.{{ search_domain }}
+      - PA_CREATE_ADMIN=1
+      - PA_APPLICATION_URL={{ pdns_admin_sso.application_url }}
+{% if pdns_admin_session_key | default('') | length > 0 %}
+      - PA_SESSION_KEY={{ pdns_admin_session_key }}
+{% endif %}
+{% if pdns_admin_sso.client_id | default('') | length > 0 %}
+      # Okta OIDC SSO — enabled when client_id is set in vars/sso.yml
+      # Entrypoint compares to literal "true" string — do not use 1/0
+      - PA_OIDC_ENABLED=true
+      - PA_OIDC_AUTO_PROVISION=true
+      - PA_OIDC_SYNC_USER_INFO=true
+      - PA_OIDC_GROUP_MAPPING=true
+      - PA_OIDC_GENERIC_ENABLED=true
+      - PA_OIDC_GENERIC_AUTO_DISCOVERY=true
+      - PA_OIDC_GENERIC_CLIENT_ID={{ pdns_admin_sso.client_id }}
+      - PA_OIDC_GENERIC_CLIENT_SECRET={{ pdns_admin_oidc_client_secret }}
+      - PA_OIDC_GENERIC_METADATA_URL={{ okta_issuer_url }}/.well-known/openid-configuration
+      - PA_OIDC_GENERIC_GROUPS_ATTR=groups
+      - PA_OIDC_DEFAULT_PERMISSION_TEMPLATE={{ pdns_admin_sso.readers_template_id }}
+      - PA_OIDC_PERMISSION_TEMPLATE_MAPPING={{ pdns_admin_sso.admin_group_okta }}:{{ pdns_admin_sso.admin_template_id }},{{ pdns_admin_sso.readers_group_okta }}:{{ pdns_admin_sso.readers_template_id }}
+{% endif %}
+    volumes:
+      - ./auth/data:/var/lib/powerdns
+    depends_on:
+      - pdns-auth
+    networks:
+      - pdns
+
+networks:
+  pdns:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

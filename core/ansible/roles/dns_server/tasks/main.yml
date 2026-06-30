@@ -1,0 +1,204 @@
+---
+# roles/dns_server/tasks/main.yml
+#
+# Installs Docker on dns-01 and deploys PowerDNS via docker compose.
+# Two containers share a bridge network:
+#   pdns-auth     — authoritative server (SQLite backend, REST API on :8081)
+#   pdns-recursor — recursive resolver (:53); forwards internal zone to auth,
+#                   everything else to Cloudflare
+#
+# Required vars:
+#   pdns_api_key   — PowerDNS REST API key (vault)
+#   search_domain, upstream_dns (from network_topology.yml)
+
+- name: Validate required DNS server variables
+  ansible.builtin.assert:
+    that:
+      - pdns_api_key is defined
+      - pdns_api_key | length > 0
+      - search_domain is defined
+      - upstream_dns is defined
+      - upstream_dns | length > 0
+    fail_msg: >
+      dns_server requires pdns_api_key, search_domain, and upstream_dns.
+      Add pdns_api_key to secrets/vault.yml before running this playbook.
+  no_log: true
+
+- name: Install prerequisite packages
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+      - sqlite3
+    state: present
+    update_cache: true
+
+- name: Create keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Download Docker GPG key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/debian/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: '0644'
+
+- name: Add Docker apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') }}
+      signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/debian
+      {{ ansible_distribution_release }} stable
+    state: present
+    filename: docker
+
+- name: Install Docker Engine and Compose plugin
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: Ensure Docker service is enabled and running
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+
+# systemd-resolved's stub listener on 127.0.0.53:53 does not conflict with
+# the container binding a real host IP, but when docker maps 0.0.0.0:53 it
+# does. Disable the stub to avoid ambiguity and port conflicts.
+
+- name: Disable systemd-resolved DNS stub listener
+  ansible.builtin.lineinfile:
+    path: /etc/systemd/resolved.conf
+    regexp: '^#?DNSStubListener='
+    line: 'DNSStubListener=no'
+  register: resolved_conf_change
+
+- name: Restart systemd-resolved if config changed
+  ansible.builtin.systemd:
+    name: systemd-resolved
+    state: restarted
+  when: resolved_conf_change.changed
+
+- name: Point /etc/resolv.conf at upstream temporarily (avoids breaking host DNS after stub disable)
+  ansible.builtin.copy:
+    dest: /etc/resolv.conf
+    content: |
+      nameserver {{ upstream_dns[0] }}
+      nameserver {{ upstream_dns[1] | default(upstream_dns[0]) }}
+      search {{ search_domain }}
+    mode: '0644'
+  when: resolved_conf_change.changed
+
+- name: Create PowerDNS directory structure
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - /opt/powerdns
+    - /opt/powerdns/auth
+    - /opt/powerdns/auth/data
+    - /opt/powerdns/recursor
+
+- name: Deploy pdns-auth.conf
+  ansible.builtin.template:
+    src: pdns-auth.conf.j2
+    dest: /opt/powerdns/auth/pdns.conf
+    mode: '0644'
+  register: _auth_conf
+
+- name: Deploy recursor.conf
+  ansible.builtin.template:
+    src: pdns-recursor.conf.j2
+    dest: /opt/powerdns/recursor/recursor.conf
+    mode: '0644'
+  register: _recursor_conf
+
+- name: Deploy docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: /opt/powerdns/docker-compose.yml
+    mode: '0644'
+  register: _compose_file
+
+- name: Copy SQLite3 schema file
+  ansible.builtin.copy:
+    src: pdns-sqlite3-schema.sql
+    dest: /opt/powerdns/auth/schema.sqlite3.sql
+    mode: '0644'
+
+- name: Initialize pdns-auth SQLite3 database (first run only)
+  ansible.builtin.command:
+    cmd: sqlite3 /opt/powerdns/auth/data/pdns.sqlite3 ".read /opt/powerdns/auth/schema.sqlite3.sql"
+  args:
+    creates: /opt/powerdns/auth/data/pdns.sqlite3
+
+- name: Set data directory ownership to pdns user (UID 953 in pdns-auth container)
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: '953'
+    group: '953'
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /opt/powerdns/auth/data, mode: '0775' }
+    - { path: /opt/powerdns/auth/data/pdns.sqlite3, mode: '0664' }
+
+- name: Copy PowerAdmin SQLite schema file
+  ansible.builtin.copy:
+    src: poweradmin-sqlite-schema.sql
+    dest: /opt/powerdns/auth/poweradmin-schema.sql
+    mode: '0644'
+
+- name: Apply PowerAdmin schema (skipped if users table already exists)
+  ansible.builtin.shell: |
+    sqlite3 /opt/powerdns/auth/data/pdns.sqlite3 "SELECT name FROM sqlite_master WHERE type='table' AND name='users';" | \
+      grep -q users || \
+    sqlite3 /opt/powerdns/auth/data/pdns.sqlite3 ".read /opt/powerdns/auth/poweradmin-schema.sql"
+  changed_when: false
+
+- name: Start PowerDNS via docker compose
+  ansible.builtin.command: docker compose up -d
+  args:
+    chdir: /opt/powerdns
+  register: _compose_up
+  changed_when: >
+    'Started' in _compose_up.stdout or
+    'Created' in _compose_up.stdout or
+    'Recreated' in _compose_up.stdout
+
+- name: Restart pdns-auth if config changed
+  ansible.builtin.command: docker compose restart pdns-auth
+  args:
+    chdir: /opt/powerdns
+  when: _auth_conf.changed and not _compose_up.changed
+
+- name: Restart pdns-recursor if config changed
+  ansible.builtin.command: docker compose restart pdns-recursor
+  args:
+    chdir: /opt/powerdns
+  when: _recursor_conf.changed and not _compose_up.changed
+
+- name: Inform user PowerDNS is deployed
+  ansible.builtin.debug:
+    msg: |
+      PowerDNS + PowerAdmin running on dns-01 ({{ ansible_default_ipv4.address }}).
+
+      pdns-auth  REST API : http://{{ ansible_default_ipv4.address }}:8081
+      pdns-recursor DNS   : {{ ansible_default_ipv4.address }}:53
+      PowerAdmin GUI      : http://{{ ansible_default_ipv4.address }}:8082
+
+      Forward zone        : {{ search_domain }} -> pdns-auth (authoritative)
+      Upstream forwarder  : {{ upstream_dns | join(', ') }}
+
+      PowerAdmin first login: check container logs for generated password:
+        docker logs poweradmin | grep Password

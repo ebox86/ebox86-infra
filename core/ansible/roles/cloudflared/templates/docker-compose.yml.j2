@@ -1,0 +1,16 @@
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    network_mode: host
+    command: tunnel --no-autoupdate run --token {{ cloudflare_tunnel_token }}
+    # network_mode: host is REQUIRED here. Confirmed via Connector
+    # diagnostics in the Zero Trust dashboard: without it, cloudflared
+    # reports its own Private IP as a Docker bridge address (172.18.x.x),
+    # not the VM's real LAN IP (10.0.0.30) — meaning it was isolated
+    # behind Docker's default NAT'd bridge network and could not reach
+    # ingress targets like 10.0.0.10:8006 (Proxmox) reliably. Host
+    # networking makes cloudflared share the VM's actual network
+    # namespace, so it sees and routes via 10.0.0.0/24 directly, the
+    # same as any other process running natively on the VM.

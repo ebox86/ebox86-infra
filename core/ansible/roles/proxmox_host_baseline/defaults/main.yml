@@ -1,0 +1,25 @@
+---
+# roles/proxmox_host_baseline/defaults/main.yml
+
+# Gate for the destructive ZFS mirror creation task — must be explicitly
+# overridden with -e create_bulk_storage_pool=true to run.
+create_bulk_storage_pool: false
+
+# Device paths for the 2x 1TB spinning disks earmarked for the 'tank'
+# ZFS mirror. Confirm these match `lsblk` / `ls /dev/disk/by-id/` output
+# on pve-01 before running with create_bulk_storage_pool=true — device
+# names like /dev/sda can theoretically shift if disks are added/removed,
+# so by-id paths are safer for anything beyond a one-off run.
+bulk_storage_disk_1: /dev/sda
+bulk_storage_disk_2: /dev/sdb
+
+# Gate for wiping the old mSATA install (leftover Proxmox install from
+# before the NVMe/ZFS reinstall) — must be explicitly overridden with
+# -e wipe_msata_disk=true to run. DESTRUCTIVE.
+wipe_msata_disk: false
+msata_disk: /dev/sdc
+
+# Gate for creating a single-disk ZFS pool on the (already-wiped) mSATA
+# disk — must be explicitly overridden with -e create_msata_pool=true.
+# Run this AFTER wipe_msata_disk=true has completed successfully.
+create_msata_pool: false

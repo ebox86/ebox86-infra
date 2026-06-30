@@ -1,0 +1,86 @@
+---
+# roles/proxmox_acme_cloudflare/tasks/main.yml
+#
+# Sets up Let's Encrypt via ACME DNS-01 challenge using the Cloudflare
+# plugin, for pve-01's web UI. Uses a scoped Cloudflare API Token (not
+# the legacy Global API Key).
+#
+# NOTE on account registration: `pvenode acme account register` is
+# interactive (prompts to accept the Let's Encrypt TOS) and reads from
+# the controlling terminal directly via ReadLine — it does NOT accept
+# piped stdin. Rather than emulate a TTY (e.g. via expect/pexpect),
+# this role calls the Proxmox API directly via `pvesh`, which has no
+# interactive prompt at all. This is a simpler, dependency-free
+# alternative to TTY automation, confirmed working in community use
+# (see github.com/lae/ansible-role-proxmox/issues/34).
+#
+# Required vars (pass via vault/group_vars, never hardcode):
+#   acme_email             - email for the Let's Encrypt account
+#   acme_domain            - FQDN to issue the cert for (e.g. pve-01.ebox86.com)
+#   cloudflare_api_token   - scoped CF API token (Zone:DNS:Edit, Zone:Zone:Read)
+#   cloudflare_zone_id     - Zone ID for the domain in Cloudflare
+#
+# NOTE: DNS-01 requires ebox86.com's nameservers to be pointed at
+# Cloudflare already (confirmed working per prior setup).
+
+- name: Check if ACME account already exists
+  ansible.builtin.command: pvenode acme account list
+  register: acme_account_list
+  changed_when: false
+
+- name: Fetch current Let's Encrypt Terms of Service URL
+  ansible.builtin.command: >
+    pvesh get /cluster/acme/tos --directory https://acme-v02.api.letsencrypt.org/directory
+  register: acme_tos
+  changed_when: false
+  when: "'default' not in acme_account_list.stdout"
+
+- name: Register ACME account via the Proxmox API directly (no interactive prompt)
+  ansible.builtin.command: >
+    pvesh create /cluster/acme/account
+    -name default
+    -contact {{ acme_email }}
+    -directory https://acme-v02.api.letsencrypt.org/directory
+    -tos_url {{ acme_tos.stdout | trim }}
+  when: "'default' not in acme_account_list.stdout"
+
+- name: Check if the cloudflare ACME plugin already exists
+  ansible.builtin.command: pvenode acme plugin config cloudflare
+  register: acme_plugin_check
+  changed_when: false
+  failed_when: false
+
+- name: Write temporary Cloudflare credentials file for plugin setup
+  ansible.builtin.copy:
+    dest: /root/.cf-acme-credentials.tmp
+    content: |
+      CF_Token={{ cloudflare_api_token }}
+      CF_Zone_ID={{ cloudflare_zone_id }}
+    mode: '0600'
+  when: acme_plugin_check.rc != 0
+
+- name: Add the Cloudflare DNS-01 ACME plugin
+  ansible.builtin.command: >
+    pvenode acme plugin add dns cloudflare --api cf
+    --data /root/.cf-acme-credentials.tmp
+  when: acme_plugin_check.rc != 0
+
+- name: Remove temporary Cloudflare credentials file
+  ansible.builtin.file:
+    path: /root/.cf-acme-credentials.tmp
+    state: absent
+  when: acme_plugin_check.rc != 0
+
+- name: Configure the domain entry on this node (DNS challenge via cloudflare plugin)
+  ansible.builtin.command: >
+    pvenode config set -acmedomain0 {{ acme_domain }},plugin=cloudflare
+  register: acme_domain_config
+  changed_when: "'already' not in (acme_domain_config.stderr | default(''))"
+
+- name: Order the certificate
+  ansible.builtin.command: pvenode acme cert order
+  register: acme_order_result
+  changed_when: "'Certificate' in acme_order_result.stdout or 'order' in acme_order_result.stdout"
+  failed_when:
+    - acme_order_result.rc != 0
+    - "'valid' not in (acme_order_result.stdout | default('')) | lower"

@@ -1,0 +1,43 @@
+---
+# vars/sso.yml
+#
+# Non-secret SSO/OIDC configuration for services.
+# Client secrets live in secrets/vault.yml.
+#
+# Okta app for Proxmox:
+#   Sign-in redirect URI:  https://pve-01.ebox86.com
+#
+# Okta app for PowerAdmin:
+#   Sign-in redirect URI:  https://dns-01.ebox86.com/oidc/callback
+#   Sign-out redirect URI: https://dns-01.ebox86.com
+
+okta_issuer_url: "https://integrator-7406013.okta.com/oauth2/default"
+
+proxmox_sso:
+  realm: okta
+  realm_comment: "Okta OIDC SSO"
+  client_id: "0oa14f5v5ic069SGJ698"          # fill in after creating Okta app for Proxmox
+  username_claim: email
+  autocreate: true
+  groups_claim: groups         # Okta claim name — must be added to Okta app ID token
+  groups_autocreate: true      # create Proxmox groups that don't exist yet
+  groups_overwrite: true       # Okta is source of truth; remove stale group memberships
+  # Proxmox suffixes the realm name: Okta group "devops-admins" → Proxmox group "devops-admins-okta"
+  admin_group_okta: devops-admin             # group name as it exists in Okta
+  admin_group_proxmox: devops-admin-okta     # what Proxmox will call it after sync
+  readers_group_okta: devops-readers         # read-only group in Okta
+  readers_group_proxmox: devops-readers-okta # what Proxmox will call it after sync
+
+pdns_admin_sso:
+  client_id: "0oa14ndk33fitdEvC698"
+  # Required secrets in vault (add before running playbook 14):
+  #   pdns_admin_oidc_client_secret   — from Okta app → Client Secrets
+  #   pdns_admin_session_key          — run: openssl rand -hex 32
+  #
+  # PowerAdmin permission template names (from perm_templ table — names, not IDs):
+  #   Administrator  |  Viewer
+  admin_group_okta: devops-admin
+  admin_template_id: "Administrator"
+  readers_group_okta: devops-readers
+  readers_template_id: "Viewer"
+  application_url: "https://dns-01.ebox86.com"

@@ -1,0 +1,28 @@
+---
+# playbooks/11_deploy_dns_server.yml
+#
+# Installs Docker and deploys PowerDNS on dns-01.
+# Run AFTER playbook 10_provision_dns01.yml.
+#
+# Two containers are deployed via docker compose:
+#   pdns-auth     — authoritative server (SQLite, REST API :8081)
+#   pdns-recursor — resolver (:53); splits ebox86.com to auth, rest to Cloudflare
+#
+# Requires secrets/vault.yml:
+#   pdns_api_key              — PowerDNS REST API key
+#   pdns_admin_session_key    — PowerAdmin session key (openssl rand -hex 32)
+#   pdns_admin_oidc_client_secret — Okta client secret (set when enabling SSO via playbook 14)
+#
+# Usage:
+#   ansible-playbook playbooks/11_deploy_dns_server.yml \
+#     --vault-password-file ~/.vault_pass.txt
+
+- name: Deploy PowerDNS on dns-01
+  hosts: dns_servers
+  become: true
+  vars_files:
+    - ../vars/network_topology.yml
+    - ../vars/sso.yml
+    - ../secrets/vault.yml
+  roles:
+    - dns_server

@@ -1,0 +1,205 @@
+---
+# playbooks/40_bootstrap_okd_cluster.yml
+#
+# Post-install OKD bootstrap. Run once after the cluster is up and
+# the kubeconfig is in place at ~/.kube/config.
+#
+# What this does:
+#   - Configures Okta OIDC as the cluster identity provider
+#   - Grants cluster-admin to your Okta user
+#   - Removes the temporary kubeadmin credential (optional, tagged)
+#
+# Requires secrets/vault.yml:
+#   okta_client_secret   — from Okta app → Client Secrets
+#
+# Requires vars/sso.yml:
+#   okta_issuer_url      — Okta authorization server URL
+#
+# Requires vars/okd_topology.yml:
+#   okd_okta.client_id   — from Okta app
+#   okd_okta.admin_email — your Okta login email, gets cluster-admin
+#
+# Usage:
+#   ansible-playbook playbooks/40_bootstrap_okd_cluster.yml
+#   ansible-playbook playbooks/40_bootstrap_okd_cluster.yml --tags remove_kubeadmin
+
+- name: Bootstrap OKD cluster post-install
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../vars/sso.yml
+    - ../vars/okd_topology.yml
+    - ../secrets/vault.yml
+  vars:
+    kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default(lookup('env', 'HOME') + '/.kube/config', true) }}"
+    oauth_callback: "https://oauth-openshift.apps.{{ okd_cluster.fqdn }}/oauth2callback/okta"
+
+  tasks:
+
+    - name: Verify oc is available and cluster is reachable
+      ansible.builtin.command: oc whoami --kubeconfig {{ kubeconfig }}
+      register: oc_whoami
+      failed_when: oc_whoami.rc != 0
+      changed_when: false
+
+    - name: Show current cluster identity
+      ansible.builtin.debug:
+        msg: "Connected as {{ oc_whoami.stdout }} — proceeding with bootstrap"
+
+    - name: Create Okta client secret in openshift-config namespace
+      ansible.builtin.command: >
+        oc create secret generic okta-client-secret
+        --from-literal=clientSecret={{ okta_client_secret }}
+        -n openshift-config
+        --kubeconfig {{ kubeconfig }}
+        --dry-run=client -o yaml
+      register: secret_yaml
+      changed_when: false
+
+    - name: Apply Okta client secret
+      ansible.builtin.shell: >
+        oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: "{{ secret_yaml.stdout }}"
+
+    - name: Apply Okta OIDC identity provider
+      ansible.builtin.shell: >
+        oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: config.openshift.io/v1
+          kind: OAuth
+          metadata:
+            name: cluster
+          spec:
+            identityProviders:
+            - name: okta
+              mappingMethod: claim
+              type: OpenID
+              openID:
+                clientID: "{{ okd_okta.client_id }}"
+                clientSecret:
+                  name: okta-client-secret
+                extraScopes:
+                  - email
+                  - profile
+                claims:
+                  preferredUsername:
+                    - email
+                  name:
+                    - name
+                  email:
+                    - email
+                  groups:
+                    - groups
+                issuer: "{{ okd_okta.issuer_url }}"
+
+    - name: Wait for OAuth operator to roll out
+      ansible.builtin.command: >
+        oc rollout status deployment/oauth-openshift
+        -n openshift-authentication
+        --timeout=300s
+        --kubeconfig {{ kubeconfig }}
+      changed_when: false
+
+    - name: Create OKD group objects for Okta groups
+      ansible.builtin.command: >
+        oc adm groups new {{ item.okta_group }}
+        --kubeconfig {{ kubeconfig }}
+      loop: "{{ okd_okta.groups }}"
+      loop_control:
+        label: "{{ item.okta_group }}"
+      register: group_create
+      failed_when: group_create.rc != 0 and 'already exists' not in group_create.stderr
+      changed_when: group_create.rc == 0
+
+    - name: Bind cluster roles to Okta groups
+      ansible.builtin.command: >
+        oc adm policy add-cluster-role-to-group {{ item.role }}
+        {{ item.okta_group }}
+        --kubeconfig {{ kubeconfig }}
+      loop: "{{ okd_okta.groups }}"
+      loop_control:
+        label: "{{ item.okta_group }} -> {{ item.role }}"
+
+    - name: Configure Alertmanager email receiver
+      tags: [alertmanager]
+      ansible.builtin.shell: >
+        oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: alertmanager-main
+            namespace: openshift-monitoring
+          stringData:
+            alertmanager.yaml: |
+              global:
+                smtp_smarthost: "{{ okd_alerting.smtp_host }}"
+                smtp_from: "{{ okd_alerting.email_from }}"
+                smtp_auth_username: "{{ okd_alerting.smtp_username }}"
+                smtp_auth_password: "{{ mailjet_secret_key }}"
+                smtp_require_tls: true
+              route:
+                group_by: ['alertname', 'namespace', 'severity']
+                group_wait: 30s
+                group_interval: 5m
+                repeat_interval: 12h
+                receiver: default
+                routes:
+                  - match:
+                      severity: critical
+                    receiver: email-critical
+                    repeat_interval: 1h
+                  - match:
+                      severity: warning
+                    receiver: email-warning
+              receivers:
+                - name: default
+                - name: email-critical
+                  email_configs:
+                    - to: "{{ okd_alerting.email_to }}"
+                      send_resolved: true
+                      headers:
+                        Subject: '[OKD CRITICAL] {% raw %}{{ .GroupLabels.alertname }}{% endraw %}'
+                - name: email-warning
+                  email_configs:
+                    - to: "{{ okd_alerting.email_to }}"
+                      send_resolved: true
+                      headers:
+                        Subject: '[OKD WARNING] {% raw %}{{ .GroupLabels.alertname }}{% endraw %}'
+
+    - name: Display next steps
+      ansible.builtin.debug:
+        msg: |
+          Okta IdP configured.
+
+          Log into the console with your Okta account:
+            {{ "https://console-openshift-console.apps." + okd_cluster.fqdn }}
+
+          Callback URL (must be registered in Okta app):
+            {{ oauth_callback }}
+
+          Group role bindings:
+          {% for g in okd_okta.groups %}
+            {{ g.okta_group }} -> {{ g.role }}
+          {% endfor %}
+
+          Manage access in Okta: add/remove users from devops-admin or devops-readers groups.
+          OKD group membership syncs automatically on each login.
+
+          Once you have verified Okta login works, remove kubeadmin:
+            ansible-playbook playbooks/40_bootstrap_okd_cluster.yml --tags remove_kubeadmin
+
+    - name: Remove kubeadmin secret (disables emergency backdoor)
+      ansible.builtin.command: >
+        oc delete secret kubeadmin -n kube-system
+        --kubeconfig {{ kubeconfig }}
+      tags:
+        - remove_kubeadmin
+        - never
+      register: delete_result
+      failed_when: delete_result.rc != 0 and 'not found' not in delete_result.stderr
+      changed_when: delete_result.rc == 0

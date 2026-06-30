@@ -1,0 +1,129 @@
+---
+# vars/network_topology.yml
+# Single source of truth for the homelab IP schema.
+#
+# Hardware:
+#   - 1x HPE ProLiant MicroServer Gen10 Plus v2 -> Proxmox host (pve-01)
+#       Runs infra VMs (dns-01, cloudflared-01, etc.) AND the OKD control
+#       node as a VM.
+#   - 2x HPE ProLiant ML350 Gen10 -> bare-metal OKD nodes via the OKD
+#       Assisted Installer (NOT virtualized, NOT managed by Proxmox/Ansible
+#       VM provisioning — separate install flow).
+#
+# OKD topology is therefore a HYBRID cluster: 1 virtualized control-plane
+# node (on pve-01) + 2 bare-metal nodes (the ML350s). NOTE: etcd quorum
+# conventionally wants 3 control-plane members — confirm with the user
+# whether this is meant as a compact 3-node cluster (all three nodes
+# schedulable, control+worker combined) or true 2-worker design before
+# finalizing OKD role assignments.
+#
+# iLO management interfaces are on their own dedicated block (10.0.0.200+)
+# to avoid colliding with service/VM static IPs in the 10.0.0.10-99 range.
+#
+# dns-01 runs PowerDNS (containerized, docker compose). Split-DNS:
+#   - pdns-auth: authoritative for ebox86.com + lab.ebox86.com zones.
+#               REST API on :8081 — used by Proxmox SDN for auto-DNS
+#               (VMs get A/PTR records registered automatically on creation).
+#   - pdns-recursor: resolver on :53. Forwards ebox86.com to pdns-auth,
+#               everything else to Cloudflare (1.1.1.1 / 1.0.0.1).
+#   - Proxmox SDN DNS plugin "pdns" points to pdns-auth API, reverse mask /24.
+
+search_domain: ebox86.com
+
+geolocation_lat: "40.4414528"
+geolocation_lon: "-79.9967089"
+
+# No single lab gateway — each VLAN has its own SVI on the 9004 (10.<vlan>.0.1).
+# VLAN 10 mgmt:  10.10.0.1   VLAN 20 infra:  10.20.0.1
+# VLAN 30 okd:   10.0.1.1    VLAN 40 trusted: 10.40.0.1
+# VLAN 50 iot:   10.50.0.1   VLAN 60 guest:   10.60.0.1   VLAN 70 cameras: 10.70.0.1
+
+# Upstream DNS forwarders (Cloudflare) — used by dns-01's conditional
+# forwarder zone for anything not matched by an internal A record, and
+# by cloud-init nameservers on VMs before dns-01 exists / for fallback.
+upstream_dns:
+  - 1.1.1.1
+  - 1.0.0.1
+
+# Static infra block — Proxmox hosts, DNS, core services.
+# DHCP (Xfinity-managed) lives at 10.0.10.2-254 and never touches this range.
+infra_subnet: 10.0.0.0/24
+infra_netmask: 255.255.255.0
+
+network_hosts:
+  gw_mc_01:
+    hostname: gw-mc-01
+    ip: 10.0.0.254
+    hardware: "Aruba 9004 Mobility Controller"
+    role: "Homelab gateway — inter-VLAN routing, NAT, DHCP"
+  sw_core_01:
+    hostname: sw-core-01
+    ip: 10.0.0.250
+    hardware: "Aruba CX 6000 switch"
+    role: "Core access/distribution switch"
+  ap_01:
+    hostname: ap-01
+    ip: 10.10.0.251
+    hardware: "Aruba 505 AP"
+    role: "WiFi mesh portal — trusted / IoT / guest SSIDs"
+
+infra_hosts:
+  pve_01:
+    hostname: pve-01
+    ip: 10.0.0.10
+    hardware: "HPE ProLiant MicroServer Gen10 Plus v2"
+    role: "Proxmox host — infra VMs + OKD control-plane VM"
+  dns_01:
+    hostname: dns-01
+    ip: 10.20.0.20          # VLAN 20 (infra) — migrated from 10.0.0.20
+    role: "PowerDNS Server (VM on pve-01) — authoritative + recursor, REST API :8081"
+  cloudflared_01:
+    hostname: cloudflared-01
+    ip: 10.20.0.30          # VLAN 20 (infra) — migrated from 10.0.0.30
+    role: "Cloudflare Tunnel connector (VM on pve-01) — tunnel name: ebox86.com"
+
+# Service vhosts — same IPs as infra hosts but different DNS names.
+# Included in A-record creation only; PTR records stay on the canonical hostname.
+service_hosts:
+  poweradmin:
+    hostname: poweradmin
+    ip: 10.0.0.20
+    role: "PowerAdmin web UI for PowerDNS (dns-01 :8082)"
+
+# iLO / management interfaces — kept entirely separate from service IPs
+# to avoid collisions like dns-01 vs iLO both wanting .20.
+ilo_hosts:
+  pve_01_ilo:
+    hostname: ilo-micro
+    ip: 10.0.0.200
+    hardware: "HPE MicroServer Gen10 Plus v2 iLO"
+  ml350_01_ilo:
+    hostname: ilo-ml350-01
+    ip: 10.0.0.201
+    hardware: "HPE ML350 Gen10 #1 iLO"
+  ml350_02_ilo:
+    hostname: ilo-ml350-02
+    ip: 10.0.0.202
+    hardware: "HPE ML350 Gen10 #2 iLO"
+  # NOTE: existing iLO interfaces are currently set to .20/.21/.22 —
+  # these collide with dns-01 and infra service IPs and MUST be
+  # reassigned to the .200+ block above before dns-01 goes live.
+
+# DHCP pool managed by the Xfinity gateway — documented here for reference only,
+# Ansible does not manage this range.
+dhcp_subnet: 10.0.10.0/24
+dhcp_range_start: 10.0.10.2
+dhcp_range_end: 10.0.10.254
+
+# OKD — hybrid cluster, reserved block. Not built yet.
+# okd_subnet: 10.0.1.0/24
+# okd_hosts:
+#   control_plane_vm:        # runs on pve-01 as a VM
+#     hostname: okd-cp-01
+#     ip: 10.0.1.10
+#   ml350_01:                 # bare-metal, via Assisted Installer
+#     hostname: okd-node-01
+#     ip: 10.0.1.20
+#   ml350_02:                 # bare-metal, via Assisted Installer
+#     hostname: okd-node-02
+#     ip: 10.0.1.21

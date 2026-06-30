@@ -1,0 +1,67 @@
+---
+# playbooks/31_deploy_okd_assisted_installer.yml
+#
+# Deploy the OKD Assisted Installer container stack on the okd-ai VM.
+# Exposes the web UI on port 8080 for cluster configuration.
+#
+# Prerequisites:
+#  - okd-ai VM must be running (provisioned by playbook 30)
+#  - VM must have network connectivity and internet access
+#  - okd-ai must be reachable via SSH (added to inventory or auto-discovered)
+#
+# Usage:
+#   ansible-playbook playbooks/31_deploy_okd_assisted_installer.yml
+
+- name: Deploy OKD Assisted Installer
+  hosts: okd_ai
+  become: true
+  vars_files:
+    - ../secrets/vault.yml
+    - ../vars/okd_topology.yml
+
+  roles:
+    - okd_assisted_installer
+
+  post_tasks:
+    - name: Display assisted installer access information
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          OKD Assisted Installer is now running!
+          ============================================================
+          
+          Access the web UI: {{ okd_assisted_installer.ui_url }}
+          
+          The UI is available on port {{ okd_assisted_installer.ui_port }}.
+          
+          IMPORTANT NEXT STEPS:
+          
+          1. Open a browser and navigate to {{ okd_assisted_installer.ui_url }}
+          
+          2. Create a new cluster with these settings:
+             - Cluster name: {{ okd_cluster.name }}
+             - Base domain: {{ okd_cluster.domain }}
+             - OpenShift version: {{ okd_cluster.openshift_version }}
+             - Network type: {{ okd_cluster.network_type }}
+             - API VIP: {{ okd_api_vip }}
+             - Ingress VIP: {{ okd_ingress_vip }}
+          
+          3. Add hosts:
+             - Control plane: {{ okd_control_plane.hostname }} ({{ okd_control_plane.ip }})
+             - Worker 0:      {{ okd_workers[0].hostname }} ({{ okd_workers[0].ip }})
+             - Worker 1:      {{ okd_workers[1].hostname }} ({{ okd_workers[1].ip }})
+          
+          4. Generate discovery ISO images
+          
+          5. Boot the OKD nodes with the discovery ISOs:
+             - {{ okd_control_plane.hostname }} on Proxmox VM {{ okd_control_plane.vmid }}
+             - {{ okd_workers[0].hostname }} on bare metal ml350-01
+             - {{ okd_workers[1].hostname }} on bare metal ml350-02
+          
+          6. Watch the installation progress in the UI
+          
+          Reference configuration at: /opt/okd/cluster-config/cluster-config.yml
+          
+          After hosts are discovered and config is complete, the installer
+          will bootstrap the cluster automatically.
+          ============================================================

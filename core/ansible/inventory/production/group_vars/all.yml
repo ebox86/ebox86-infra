@@ -1,0 +1,15 @@
+---
+# inventory/production/group_vars/all.yml
+#
+# These are defaults only — per-host or per-group vars override them.
+# Gateways are VLAN-specific (10.<vlan>.0.1); there is no single lab gateway.
+# dns_nameservers should point to dns-01 once it is live on VLAN 20.
+search_domain: ebox86.com
+
+# DNS — dns-01 is primary; 1.1.1.1 is fallback for bootstrap before dns-01 is reachable.
+dns_nameservers: &dns_nameservers
+  - 10.20.0.20
+  - 1.1.1.1
+upstream_dns: *dns_nameservers
+
+ansible_python_interpreter: /usr/bin/python3

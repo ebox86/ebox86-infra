@@ -1,0 +1,46 @@
+---
+# vars/wireless.yml
+#
+# Wireless network config for the ebox86 homelab.
+# APs run Aruba Instant mode — ap-01 is the Virtual Controller (VC).
+# Passwords live in secrets/vault.yml (trusted_wifi_password, iot_wifi_password,
+# guest_wifi_password).
+
+ap_mgmt_vlan: 10
+
+# Static DHCP reservations rendered into dnsmasq.conf by playbook 64.
+# Add any device that needs a fixed IP (APs, printers, etc.) here.
+dhcp_static_hosts:
+  # VLAN 10 — management
+  - mac: "fc:7f:f1:c7:c9:22"
+    ip: "10.10.0.251"
+    name: ap-01
+  # VLAN 20 — storage (worker storage NICs for NFS traffic)
+  - mac: "08:f1:ea:7b:4c:d8"
+    ip: "10.20.0.22"
+    name: okd-worker-0-storage
+  - mac: "b4:7a:f1:4f:7c:64"
+    ip: "10.20.0.21"
+    name: okd-worker-1-storage
+
+
+
+ssids:
+  trusted:
+    name: something_gay
+    vlan: 40
+    profile: something_gay   # must match existing ssid-profile name on AP (upsert, not create-new)
+    vap: something_gay        # must match existing virtual-ap name on AP
+    client_isolation: false   # devices on trusted can talk to each other
+  # iot:
+  #   name: gay_iot
+  #   vlan: 50
+  #   profile: ssid-iot
+  #   vap: vap-iot
+  #   client_isolation: true    # IoT devices cannot reach each other
+  # guest:
+  #   name: gay_guest
+  #   vlan: 60
+  #   profile: ssid-guest
+  #   vap: vap-guest
+  #   client_isolation: true    # guests cannot reach each other

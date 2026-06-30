@@ -1,0 +1,21 @@
+---
+# playbooks/21_deploy_cloudflared.yml
+#
+# Installs Docker and deploys cloudflared on cloudflared-01, connecting
+# it to the "ebox86.com" tunnel using the token-based remotely-
+# managed pattern. Run AFTER playbooks/20_provision_cloudflared01.yml
+# has completed and cloudflared-01 has been added to inventory.
+#
+# Requires secrets/vault.yml to contain:
+#   cloudflare_tunnel_token
+#
+# Usage:
+#   ansible-playbook playbooks/21_deploy_cloudflared.yml
+
+- name: Deploy cloudflared on cloudflared-01
+  hosts: cloudflared_hosts
+  become: true
+  vars_files:
+    - ../secrets/vault.yml
+  roles:
+    - cloudflared

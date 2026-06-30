@@ -1,0 +1,27 @@
+{
+  "name": "cdktn",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "synth": "cdktn synth",
+    "deploy": "cdktn deploy",
+    "diff": "cdktn diff",
+    "destroy": "cdktn destroy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@cdktn/provider-cloudflare": "^15.2.1",
+    "@types/node": "^26.0.1",
+    "cdktn": "^0.23.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  },
+  "devDependencies": {
+    "cdktn-cli": "^0.23.3",
+    "constructs": "^10.6.0"
+  }
+}

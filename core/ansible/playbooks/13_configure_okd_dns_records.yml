@@ -1,0 +1,117 @@
+---
+# playbooks/13_configure_okd_dns_records.yml
+#
+# Creates the lab.ebox86.com zone in PowerDNS and adds OKD cluster DNS records.
+# pdns-recursor forwards all ebox86.com queries to pdns-auth, so both the
+# main zone and this subdomain zone are resolved authoritatively.
+#
+# Records created in zone lab.ebox86.com:
+#   api.lab.ebox86.com           -> API VIP (10.0.1.5)
+#   api-int.lab.ebox86.com       -> API VIP (10.0.1.5)
+#   *.apps.lab.ebox86.com        -> Ingress VIP (10.0.1.6)
+#   okd-control-0.lab.ebox86.com -> 10.0.1.10
+#   okd-worker-0.lab.ebox86.com  -> 10.0.1.20
+#   okd-worker-1.lab.ebox86.com  -> 10.0.1.21
+#   okd-lb.lab.ebox86.com        -> 10.0.1.7
+#
+# Requires secrets/vault.yml: pdns_api_key
+#
+# Usage:
+#   ansible-playbook playbooks/13_configure_okd_dns_records.yml \
+#     --vault-password-file ~/.vault_pass.txt
+
+- name: Configure OKD DNS records in PowerDNS
+  hosts: dns_servers
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../vars/network_topology.yml
+    - ../vars/okd_topology.yml
+    - ../secrets/vault.yml
+  vars:
+    _pdns_api: "http://127.0.0.1:8081/api/v1/servers/localhost"
+    _cluster_zone: "{{ okd_cluster.name }}.{{ okd_cluster.domain }}"
+    _okd_records:
+      - { name: "api.{{ _cluster_zone }}.",          ip: "{{ okd_api_vip }}" }
+      - { name: "api-int.{{ _cluster_zone }}.",       ip: "{{ okd_api_vip }}" }
+      - { name: "{{ okd_control_plane.hostname }}.{{ _cluster_zone }}.", ip: "{{ okd_control_plane.ip }}" }
+      - { name: "{{ okd_workers[0].hostname }}.{{ _cluster_zone }}.",    ip: "{{ okd_workers[0].ip }}" }
+      - { name: "{{ okd_workers[1].hostname }}.{{ _cluster_zone }}.",    ip: "{{ okd_workers[1].ip }}" }
+      - { name: "{{ okd_haproxy.hostname }}.{{ _cluster_zone }}.",       ip: "{{ okd_haproxy.ip }}" }
+
+  tasks:
+
+    - name: Create {{ _cluster_zone }} zone
+      ansible.builtin.uri:
+        url: "{{ _pdns_api }}/zones"
+        method: POST
+        headers:
+          X-API-Key: "{{ pdns_api_key }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "{{ _cluster_zone }}."
+          kind: Native
+          nameservers: []
+          rrsets: []
+        status_code: [201, 422]
+      no_log: true
+
+    - name: Add OKD A records to {{ _cluster_zone }}
+      ansible.builtin.uri:
+        url: "{{ _pdns_api }}/zones/{{ _cluster_zone }}."
+        method: PATCH
+        headers:
+          X-API-Key: "{{ pdns_api_key }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          rrsets:
+            - name: "{{ item.name }}"
+              type: A
+              ttl: 3600
+              changetype: REPLACE
+              records:
+                - content: "{{ item.ip }}"
+                  disabled: false
+        status_code: 204
+      loop: "{{ _okd_records }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.ip }}"
+      no_log: true
+
+    - name: Add wildcard ingress record (*.apps.{{ _cluster_zone }})
+      ansible.builtin.uri:
+        url: "{{ _pdns_api }}/zones/{{ _cluster_zone }}."
+        method: PATCH
+        headers:
+          X-API-Key: "{{ pdns_api_key }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          rrsets:
+            - name: "*.apps.{{ _cluster_zone }}."
+              type: A
+              ttl: 3600
+              changetype: REPLACE
+              records:
+                - content: "{{ okd_ingress_vip }}"
+                  disabled: false
+        status_code: 204
+      no_log: true
+
+    - name: Display OKD DNS summary
+      ansible.builtin.debug:
+        msg: |
+          OKD DNS records configured in PowerDNS zone {{ _cluster_zone }}:
+
+            api.{{ _cluster_zone }}          -> {{ okd_api_vip }}
+            api-int.{{ _cluster_zone }}      -> {{ okd_api_vip }}
+            *.apps.{{ _cluster_zone }}       -> {{ okd_ingress_vip }}
+            {{ okd_control_plane.hostname }}.{{ _cluster_zone }} -> {{ okd_control_plane.ip }}
+            {{ okd_workers[0].hostname }}.{{ _cluster_zone }}    -> {{ okd_workers[0].ip }}
+            {{ okd_workers[1].hostname }}.{{ _cluster_zone }}    -> {{ okd_workers[1].ip }}
+            {{ okd_haproxy.hostname }}.{{ _cluster_zone }}       -> {{ okd_haproxy.ip }}
+
+          pdns-recursor resolves *.{{ _cluster_zone }} authoritatively via pdns-auth.
+          All other ebox86.com queries forward to Cloudflare.

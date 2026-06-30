@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+# Injects OIDC auto-redirect into Proxmox login page.
+# Re-run after pve-manager upgrades via dpkg hook at /etc/apt/apt.conf.d/99-pve-oidc-reinject
+
+import os, sys
+
+INDEX = "/usr/share/pve-manager/index.html.tpl"
+MARKER = "PVE-OIDC-AUTO-REDIRECT"
+
+if not os.path.exists(INDEX):
+    sys.exit(0)
+
+with open(INDEX, "r") as f:
+    content = f.read()
+
+if MARKER in content:
+    sys.exit(0)
+
+snippet = (
+    "<!-- BEGIN " + MARKER + " -->\n"
+    "<script>\n"
+    "(function() {\n"
+    "  if (document.cookie.indexOf('PVEAuthCookie=') !== -1) return;\n"
+    "  if (location.search.indexOf('code=') !== -1) return;\n"
+    "  if (location.search.indexOf('error=') !== -1) return;\n"
+    "  if (location.search.indexOf('login=1') !== -1) return;\n"
+    "  document.documentElement.style.visibility = 'hidden';\n"
+    "  fetch('/api2/json/access/openid/auth-url', {\n"
+    "    method: 'POST',\n"
+    "    headers: {'Content-Type': 'application/x-www-form-urlencoded'},\n"
+    "    body: 'realm={{ proxmox_sso.realm }}&redirect-url=' + encodeURIComponent(location.origin)\n"
+    "  })\n"
+    "  .then(function(r) { return r.json(); })\n"
+    "  .then(function(data) {\n"
+    "    if (data && data.data) { location.href = data.data; }\n"
+    "    else { document.documentElement.style.visibility = ''; }\n"
+    "  })\n"
+    "  .catch(function() { document.documentElement.style.visibility = ''; });\n"
+    "})();\n"
+    "</script>\n"
+    "<!-- END " + MARKER + " -->"
+)
+
+content = content.replace("</body>", snippet + "\n</body>")
+with open(INDEX, "w") as f:
+    f.write(content)
+print("pve-oidc-reinject: auto-redirect injected into " + INDEX)

@@ -1,0 +1,171 @@
+---
+# playbooks/04_configure_proxmox_sso.yml
+#
+# Configures Okta OIDC SSO on Proxmox VE (pve-01) with group sync.
+# Groups are synced from Okta on every login — Okta is the source of truth.
+#
+# Prerequisites:
+#   1. Create a separate OIDC app in Okta for Proxmox:
+#        Sign-in redirect URI:  https://pve-01.ebox86.com
+#        Sign-out redirect URI: https://pve-01.ebox86.com
+#   2. Add a Groups claim to the Okta app ID token:
+#        Security → API → default auth server → Claims → Add Claim
+#        Name: groups  |  Include in: ID Token  |  Value type: Groups  |  Filter: Matches regex .*
+#   3. Create a "devops-admins" group in Okta and add yourself
+#   4. Fill in proxmox_sso.client_id in vars/sso.yml
+#   5. Add proxmox_oidc_client_secret to secrets/vault.yml
+#
+# Group name mapping:
+#   Okta group "devops-admins"  →  Proxmox group "devops-admins-okta"
+#   (Proxmox appends -<realm> to all synced group names)
+#
+# Usage:
+#   ansible-playbook playbooks/04_configure_proxmox_sso.yml
+
+- name: Configure Proxmox OIDC SSO via Okta (with group sync)
+  hosts: proxmox
+  become: false
+  gather_facts: false
+  vars_files:
+    - ../vars/sso.yml
+    - ../secrets/vault.yml
+
+  handlers:
+    - name: restart pveproxy
+      ansible.builtin.service:
+        name: pveproxy
+        state: restarted
+
+  tasks:
+
+    - name: Verify pveum is available
+      ansible.builtin.command: pveum help
+      changed_when: false
+      failed_when: false
+
+    - name: Check if Okta OIDC realm already exists
+      ansible.builtin.shell: pveum realm list | grep -q "{{ proxmox_sso.realm }}"
+      register: realm_check
+      failed_when: false
+      changed_when: false
+
+    - name: Add Okta OIDC realm (first run)
+      ansible.builtin.command: >
+        pveum realm add {{ proxmox_sso.realm }}
+        --type openid
+        --issuer-url {{ okta_issuer_url }}
+        --client-id {{ proxmox_sso.client_id }}
+        --client-key {{ proxmox_oidc_client_secret }}
+        --username-claim {{ proxmox_sso.username_claim }}
+        --autocreate {{ proxmox_sso.autocreate | int }}
+        --groups-claim {{ proxmox_sso.groups_claim }}
+        --groups-autocreate {{ proxmox_sso.groups_autocreate | int }}
+        --groups-overwrite {{ proxmox_sso.groups_overwrite | int }}
+        --comment "{{ proxmox_sso.realm_comment }}"
+      when: realm_check.rc != 0
+
+    - name: Update Okta OIDC realm (idempotent on re-runs)
+      ansible.builtin.command: >
+        pveum realm modify {{ proxmox_sso.realm }}
+        --issuer-url {{ okta_issuer_url }}
+        --client-id {{ proxmox_sso.client_id }}
+        --client-key {{ proxmox_oidc_client_secret }}
+        --autocreate {{ proxmox_sso.autocreate | int }}
+        --groups-claim {{ proxmox_sso.groups_claim }}
+        --groups-autocreate {{ proxmox_sso.groups_autocreate | int }}
+        --groups-overwrite {{ proxmox_sso.groups_overwrite | int }}
+        --comment "{{ proxmox_sso.realm_comment }}"
+      when: realm_check.rc == 0
+
+    - name: Pre-create synced group so ACL can be applied before first login
+      ansible.builtin.command: >
+        pveum group add {{ proxmox_sso.admin_group_proxmox }}
+        --comment "Synced from Okta group {{ proxmox_sso.admin_group_okta }}"
+      register: group_add
+      failed_when: group_add.rc != 0 and 'already exists' not in group_add.stderr
+      changed_when: group_add.rc == 0
+
+    - name: Grant Administrator role to {{ proxmox_sso.admin_group_proxmox }} group at root
+      ansible.builtin.command: >
+        pveum acl modify /
+        --roles Administrator
+        --groups {{ proxmox_sso.admin_group_proxmox }}
+      changed_when: true
+
+    - name: Pre-create readers group so ACL can be applied before first login
+      ansible.builtin.command: >
+        pveum group add {{ proxmox_sso.readers_group_proxmox }}
+        --comment "Synced from Okta group {{ proxmox_sso.readers_group_okta }}"
+      register: readers_group_add
+      failed_when: readers_group_add.rc != 0 and 'already exists' not in readers_group_add.stderr
+      changed_when: readers_group_add.rc == 0
+
+    - name: Grant PVEAuditor role to {{ proxmox_sso.readers_group_proxmox }} group at root
+      ansible.builtin.command: >
+        pveum acl modify /
+        --roles PVEAuditor
+        --groups {{ proxmox_sso.readers_group_proxmox }}
+      changed_when: true
+
+    - name: Set okta as default realm on login page
+      ansible.builtin.command: pveum realm modify {{ proxmox_sso.realm }} --default 1
+      changed_when: true
+
+    - name: Deploy OIDC auto-redirect re-injection script
+      ansible.builtin.template:
+        src: templates/pve-oidc-reinject.py.j2
+        dest: /usr/local/bin/pve-oidc-reinject
+        mode: '0755'
+
+    - name: Inject OIDC auto-redirect into Proxmox login page
+      ansible.builtin.command: /usr/local/bin/pve-oidc-reinject
+      register: inject_result
+      changed_when: "'injected' in inject_result.stdout"
+
+    - name: Remove no-subscription nag popup from proxmoxlib.js
+      ansible.builtin.shell: |
+        JSFILE=/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+        if grep -q 'orig_cmd();' "$JSFILE"; then
+          echo "already patched"
+        else
+          sed -Ezi.bak "s/(function ?\(orig_cmd\) \{)/\1\n\torig_cmd\(\);\n\treturn;/g" "$JSFILE"
+          echo "patched"
+        fi
+      register: nag_patch
+      changed_when: "'patched' in nag_patch.stdout"
+      notify: restart pveproxy
+
+    - name: Deploy post-upgrade helper (re-applies OIDC redirect + nag patch)
+      ansible.builtin.copy:
+        dest: /usr/local/bin/pve-post-upgrade
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          /usr/local/bin/pve-oidc-reinject
+          JSFILE=/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+          if ! grep -q 'orig_cmd();' "$JSFILE"; then
+            sed -Ezi.bak "s/(function ?\(orig_cmd\) \{)/\1\n\torig_cmd\(\);\n\treturn;/g" "$JSFILE"
+          fi
+
+    - name: Install dpkg post-invoke hook to survive upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99-pve-post-upgrade
+        content: |
+          DPkg::Post-Invoke {"/usr/local/bin/pve-post-upgrade";};
+
+    - name: Display SSO configuration summary
+      ansible.builtin.debug:
+        msg: |
+          Proxmox OIDC SSO with auto-redirect configured!
+
+          Realm          : {{ proxmox_sso.realm }} (type: openid)
+          Issuer URL     : {{ okta_issuer_url }}
+          Groups claim   : {{ proxmox_sso.groups_claim }}
+          Auto-redirect  : enabled (injected into /usr/share/pve-manager/index.html.tpl)
+          Nag popup      : suppressed (patched /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js)
+          Upgrade-safe   : yes (dpkg hook at /etc/apt/apt.conf.d/99-pve-post-upgrade)
+
+          Login flow:
+            https://pve-01.ebox86.com → auto-redirects to Okta → back to Proxmox dashboard
+            No login dialog. To reach the dialog anyway (e.g. root/pam login):
+              https://pve-01.ebox86.com/?login=1  (add ?login=1 to bypass the script)

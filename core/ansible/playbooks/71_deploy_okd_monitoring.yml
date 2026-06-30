@@ -1,0 +1,348 @@
+---
+# playbooks/71_deploy_okd_monitoring.yml
+#
+# Deploys the infrastructure monitoring stack inside OKD:
+#
+#   1. Enables OKD user workload monitoring (allows custom Prometheus in user namespaces)
+#   2. Creates the `monitoring` namespace
+#   3. Deploys a standalone Prometheus with NFS-backed PVC that scrapes all infra hosts
+#   4. Deploys alert rules for host-down and high disk/memory conditions
+#
+# Prometheus is deployed as a plain Deployment (not via Prometheus Operator) so that
+# additionalScrapeConfigs for external targets are straightforward to manage.
+#
+# Scrape targets (node_exporter on port 9100):
+#   pve-01         10.0.0.10
+#   dns-01         10.20.0.20
+#   dhcp-01        10.10.0.5
+#   cloudflared-01 10.20.0.30
+#
+# Prerequisites:
+#   - playbook 70 complete (node_exporter running on all infra hosts)
+#   - playbook 50 complete (nfs-client StorageClass available)
+#   - SSH tunnel open: ssh -f -N -L 6443:10.0.1.5:6443 root@10.0.0.10
+#
+# Usage:
+#   ansible-playbook playbooks/71_deploy_okd_monitoring.yml \
+#     --vault-password-file ~/.vault_pass.txt \
+#     -e "kubeconfig=/tmp/kube-tunnel.yaml"
+
+- name: Deploy infra monitoring stack in OKD
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../vars/okd_topology.yml
+    - ../vars/network_topology.yml
+  vars:
+    kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default(lookup('env', 'HOME') + '/.kube/config', true) }}"
+    monitoring_namespace: monitoring
+    prometheus_storage_size: 20Gi
+    prometheus_retention: 30d
+    infra_scrape_targets:
+      - job_name: pve-01
+        ip: "10.0.0.10"
+      - job_name: dns-01
+        ip: "10.20.0.20"
+      - job_name: dhcp-01
+        ip: "10.10.0.5"
+      - job_name: cloudflared-01
+        ip: "10.20.0.30"
+
+  tasks:
+
+    - name: Verify cluster is reachable
+      ansible.builtin.command: oc whoami --kubeconfig {{ kubeconfig }}
+      register: _whoami
+      changed_when: false
+
+    # =========================================================================
+    # USER WORKLOAD MONITORING
+    # =========================================================================
+
+    - name: Enable OKD user workload monitoring
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cluster-monitoring-config
+            namespace: openshift-monitoring
+          data:
+            config.yaml: |
+              enableUserWorkload: true
+
+    # =========================================================================
+    # NAMESPACE
+    # =========================================================================
+
+    - name: Create monitoring namespace
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: {{ monitoring_namespace }}
+            labels:
+              openshift.io/cluster-monitoring: "false"
+
+    # =========================================================================
+    # RBAC — allow Prometheus to read cluster metrics (optional federation)
+    # =========================================================================
+
+    - name: Create Prometheus ServiceAccount
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: prometheus-infra
+            namespace: {{ monitoring_namespace }}
+
+    - name: Grant Prometheus anyuid SCC (required to run as prometheus user)
+      ansible.builtin.command: >
+        oc adm policy add-scc-to-user anyuid
+        -z prometheus-infra
+        -n {{ monitoring_namespace }}
+        --kubeconfig {{ kubeconfig }}
+      register: _scc
+      changed_when: "'already' not in _scc.stdout"
+
+    # =========================================================================
+    # PROMETHEUS CONFIG
+    # =========================================================================
+
+    - name: Deploy Prometheus scrape config
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: prometheus-infra-config
+            namespace: {{ monitoring_namespace }}
+          data:
+            prometheus.yml: |
+              global:
+                scrape_interval: 60s
+                evaluation_interval: 60s
+
+              rule_files:
+                - /etc/prometheus/rules/*.yml
+
+              scrape_configs:
+                - job_name: prometheus
+                  static_configs:
+                    - targets: ['localhost:9090']
+                - job_name: node/pve-01
+                  static_configs:
+                    - targets: ['10.0.0.10:9100']
+                      labels:
+                        instance: pve-01
+                - job_name: node/dns-01
+                  static_configs:
+                    - targets: ['10.20.0.20:9100']
+                      labels:
+                        instance: dns-01
+                - job_name: node/dhcp-01
+                  static_configs:
+                    - targets: ['10.10.0.5:9100']
+                      labels:
+                        instance: dhcp-01
+                - job_name: node/cloudflared-01
+                  static_configs:
+                    - targets: ['10.20.0.30:9100']
+                      labels:
+                        instance: cloudflared-01
+
+    - name: Deploy alert rules
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: prometheus-infra-rules
+            namespace: {{ monitoring_namespace }}
+          data:
+            infra.yml: |
+              groups:
+                - name: infra.hosts
+                  rules:
+                    - alert: InfraHostDown
+                      expr: up{job=~"node/.*"} == 0
+                      for: 2m
+                      labels:
+                        severity: critical
+                      annotations:
+                        summary: "Infra host {{ "{{" }} $labels.instance {{ "}}" }} is down"
+                        description: "node_exporter on {{ "{{" }} $labels.instance {{ "}}" }} has been unreachable for >2m"
+
+                    - alert: InfraHighDiskUsage
+                      expr: |
+                        (node_filesystem_size_bytes{job=~"node/.*",fstype!="tmpfs",mountpoint="/"} -
+                         node_filesystem_free_bytes{job=~"node/.*",fstype!="tmpfs",mountpoint="/"})
+                        / node_filesystem_size_bytes{job=~"node/.*",fstype!="tmpfs",mountpoint="/"} > 0.85
+                      for: 5m
+                      labels:
+                        severity: warning
+                      annotations:
+                        summary: "High disk usage on {{ "{{" }} $labels.instance {{ "}}" }}"
+                        description: "Root filesystem on {{ "{{" }} $labels.instance {{ "}}" }} is >85% full"
+
+                    - alert: InfraHighMemoryUsage
+                      expr: |
+                        (1 - node_memory_MemAvailable_bytes{job=~"node/.*"} /
+                         node_memory_MemTotal_bytes{job=~"node/.*"}) > 0.90
+                      for: 5m
+                      labels:
+                        severity: warning
+                      annotations:
+                        summary: "High memory usage on {{ "{{" }} $labels.instance {{ "}}" }}"
+                        description: "Memory on {{ "{{" }} $labels.instance {{ "}}" }} is >90% used"
+
+    # =========================================================================
+    # PERSISTENT STORAGE
+    # =========================================================================
+
+    - name: Create Prometheus PVC
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: prometheus-infra-data
+            namespace: {{ monitoring_namespace }}
+          spec:
+            accessModes: [ReadWriteMany]
+            storageClassName: nfs-client
+            resources:
+              requests:
+                storage: {{ prometheus_storage_size }}
+
+    # =========================================================================
+    # PROMETHEUS DEPLOYMENT
+    # =========================================================================
+
+    - name: Deploy Prometheus
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: prometheus-infra
+            namespace: {{ monitoring_namespace }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: prometheus-infra
+            template:
+              metadata:
+                labels:
+                  app: prometheus-infra
+              spec:
+                serviceAccountName: prometheus-infra
+                securityContext:
+                  fsGroup: 65534
+                containers:
+                  - name: prometheus
+                    image: quay.io/prometheus/prometheus:v2.53.0
+                    args:
+                      - --config.file=/etc/prometheus/prometheus.yml
+                      - --storage.tsdb.path=/prometheus
+                      - --storage.tsdb.retention.time={{ prometheus_retention }}
+                      - --web.enable-lifecycle
+                    ports:
+                      - containerPort: 9090
+                    volumeMounts:
+                      - name: config
+                        mountPath: /etc/prometheus
+                      - name: rules
+                        mountPath: /etc/prometheus/rules
+                      - name: data
+                        mountPath: /prometheus
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 256Mi
+                      limits:
+                        cpu: 500m
+                        memory: 512Mi
+                volumes:
+                  - name: config
+                    configMap:
+                      name: prometheus-infra-config
+                  - name: rules
+                    configMap:
+                      name: prometheus-infra-rules
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: prometheus-infra-data
+
+    - name: Create Prometheus Service
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: prometheus-infra
+            namespace: {{ monitoring_namespace }}
+          spec:
+            selector:
+              app: prometheus-infra
+            ports:
+              - port: 9090
+                targetPort: 9090
+
+    - name: Create Prometheus Route (internal access via OKD ingress)
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: prometheus-infra
+            namespace: {{ monitoring_namespace }}
+          spec:
+            host: prometheus-infra.apps.{{ okd_cluster.name }}.{{ okd_cluster.domain }}
+            to:
+              kind: Service
+              name: prometheus-infra
+            port:
+              targetPort: 9090
+            tls:
+              termination: edge
+              insecureEdgeTerminationPolicy: Redirect
+
+    - name: Wait for Prometheus to be ready
+      ansible.builtin.command: >
+        oc rollout status deployment/prometheus-infra
+        -n {{ monitoring_namespace }}
+        --timeout=120s
+        --kubeconfig {{ kubeconfig }}
+      changed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          Infra monitoring deployed!
+
+          Prometheus UI : https://prometheus-infra.apps.{{ okd_cluster.name }}.{{ okd_cluster.domain }}
+          Retention     : {{ prometheus_retention }}
+          Storage       : {{ prometheus_storage_size }} (nfs-client PVC)
+
+          Scraping:
+          {% for t in infra_scrape_targets %}
+            node/{{ t.job_name }}  http://{{ t.ip }}:9100
+          {% endfor %}
+
+          Alerts configured: InfraHostDown, InfraHighDiskUsage, InfraHighMemoryUsage
+
+          Next: playbook 72 will deploy Grafana with dashboards (Phase 2)

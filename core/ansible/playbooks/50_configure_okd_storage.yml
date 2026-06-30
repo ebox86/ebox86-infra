@@ -1,0 +1,226 @@
+---
+# playbooks/50_configure_okd_storage.yml
+#
+# Deploys the NFS subdir external provisioner and sets up a default StorageClass.
+#
+# Prerequisites:
+#   - OKD cluster running with kubeconfig at ~/.kube/config
+#   - NFS server running on pve-01 exporting /tank/okd-pv (playbook 32)
+#
+# Usage:
+#   ansible-playbook playbooks/50_configure_okd_storage.yml
+
+- name: Configure OKD storage — NFS provisioner + default StorageClass
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../vars/okd_topology.yml
+  vars:
+    kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default(lookup('env', 'HOME') + '/.kube/config', true) }}"
+    provisioner_name: k8s-sigs.io/nfs-subdir-external-provisioner
+    provisioner_namespace: nfs-provisioner
+
+  tasks:
+
+    - name: Verify oc is available and cluster is reachable
+      ansible.builtin.command: oc whoami --kubeconfig {{ kubeconfig }}
+      register: oc_whoami
+      failed_when: oc_whoami.rc != 0
+      changed_when: false
+
+    - name: Show current cluster identity
+      ansible.builtin.debug:
+        msg: "Connected as {{ oc_whoami.stdout }} — deploying NFS storage"
+
+    - name: Create nfs-provisioner namespace
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: {{ provisioner_namespace }}
+
+    - name: Create NFS provisioner ServiceAccount
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: nfs-provisioner
+            namespace: {{ provisioner_namespace }}
+
+    - name: Create NFS provisioner ClusterRole
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: nfs-provisioner-runner
+          rules:
+            - apiGroups: [""]
+              resources: ["persistentvolumes"]
+              verbs: ["get", "list", "watch", "create", "delete"]
+            - apiGroups: [""]
+              resources: ["persistentvolumeclaims"]
+              verbs: ["get", "list", "watch", "update"]
+            - apiGroups: ["storage.k8s.io"]
+              resources: ["storageclasses"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: [""]
+              resources: ["events"]
+              verbs: ["create", "update", "patch"]
+
+    - name: Bind ClusterRole to NFS provisioner ServiceAccount
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: run-nfs-provisioner
+          subjects:
+            - kind: ServiceAccount
+              name: nfs-provisioner
+              namespace: {{ provisioner_namespace }}
+          roleRef:
+            kind: ClusterRole
+            name: nfs-provisioner-runner
+            apiGroup: rbac.authorization.k8s.io
+
+    - name: Create leader-election Role for NFS provisioner
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: leader-locking-nfs-provisioner
+            namespace: {{ provisioner_namespace }}
+          rules:
+            - apiGroups: [""]
+              resources: ["endpoints"]
+              verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+    - name: Bind leader-election Role to NFS provisioner ServiceAccount
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: leader-locking-nfs-provisioner
+            namespace: {{ provisioner_namespace }}
+          subjects:
+            - kind: ServiceAccount
+              name: nfs-provisioner
+              namespace: {{ provisioner_namespace }}
+          roleRef:
+            kind: Role
+            name: leader-locking-nfs-provisioner
+            apiGroup: rbac.authorization.k8s.io
+
+    - name: Grant hostmount-anyuid SCC to NFS provisioner (required on OKD)
+      ansible.builtin.command: >
+        oc adm policy add-scc-to-user hostmount-anyuid
+        -z nfs-provisioner
+        -n {{ provisioner_namespace }}
+        --kubeconfig {{ kubeconfig }}
+      register: scc_result
+      changed_when: "'already' not in scc_result.stdout"
+
+    - name: Deploy NFS subdir external provisioner
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: nfs-subdir-external-provisioner
+            namespace: {{ provisioner_namespace }}
+          spec:
+            replicas: 1
+            strategy:
+              type: Recreate
+            selector:
+              matchLabels:
+                app: nfs-subdir-external-provisioner
+            template:
+              metadata:
+                labels:
+                  app: nfs-subdir-external-provisioner
+              spec:
+                serviceAccountName: nfs-provisioner
+                containers:
+                  - name: nfs-subdir-external-provisioner
+                    image: registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
+                    volumeMounts:
+                      - name: nfs-client-root
+                        mountPath: /persistentvolumes
+                    env:
+                      - name: PROVISIONER_NAME
+                        value: {{ provisioner_name }}
+                      - name: NFS_SERVER
+                        value: "{{ okd_nfs.nfs_server }}"
+                      - name: NFS_PATH
+                        value: "{{ okd_nfs.export_path }}"
+                volumes:
+                  - name: nfs-client-root
+                    nfs:
+                      server: "{{ okd_nfs.nfs_server }}"
+                      path: "{{ okd_nfs.export_path }}"
+
+    - name: Create default NFS StorageClass
+      ansible.builtin.shell: oc apply -f - --kubeconfig {{ kubeconfig }}
+      args:
+        stdin: |
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: nfs-client
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: {{ provisioner_name }}
+          parameters:
+            archiveOnDelete: "false"
+          reclaimPolicy: Delete
+          volumeBindingMode: Immediate
+
+    - name: Wait for provisioner pod to be ready
+      ansible.builtin.command: >
+        oc rollout status deployment/nfs-subdir-external-provisioner
+        -n {{ provisioner_namespace }}
+        --timeout=300s
+        --kubeconfig {{ kubeconfig }}
+      changed_when: false
+
+    - name: Display storage summary
+      ansible.builtin.debug:
+        msg: |
+          NFS storage provisioner deployed!
+
+          StorageClass : nfs-client (default)
+          NFS Server   : {{ okd_nfs.nfs_server }}
+          NFS Path     : {{ okd_nfs.export_path }}
+          Provisioner  : {{ provisioner_name }}
+
+          Verify with:
+            oc get storageclass
+            oc get pods -n {{ provisioner_namespace }}
+
+          Test a PVC:
+            oc create -f - <<EOF
+            apiVersion: v1
+            kind: PersistentVolumeClaim
+            metadata:
+              name: test-pvc
+            spec:
+              accessModes: [ReadWriteMany]
+              resources:
+                requests:
+                  storage: 1Gi
+            EOF
+            oc get pvc test-pvc

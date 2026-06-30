@@ -1,0 +1,27 @@
+---
+# playbooks/20_provision_cloudflared01.yml
+#
+# Clones the golden template into cloudflared-01, configures it (1 core,
+# 1GB RAM — cloudflared is lightweight, static IP on local-zfs/rpool),
+# starts it, and waits for SSH.
+#
+# Usage:
+#   ansible-playbook playbooks/20_provision_cloudflared01.yml
+
+- name: Provision cloudflared-01 VM
+  hosts: proxmox
+  become: true
+  vars:
+    vm_id: 101
+    vm_name: cloudflared-01
+    vm_ip: 10.0.0.30
+    vm_cidr: 24
+    vm_cores: 1
+    vm_memory_mb: 1024
+    vm_storage: local-zfs
+    vm_ciuser: ansible
+    ssh_pubkey_local_path: "~/.ssh/ebox86_ansible_ed25519.pub"
+  vars_files:
+    - ../vars/network_topology.yml
+  roles:
+    - proxmox_vm_clone

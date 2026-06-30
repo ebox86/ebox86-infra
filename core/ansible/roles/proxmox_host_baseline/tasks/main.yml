@@ -1,0 +1,234 @@
+---
+# roles/proxmox_host_baseline/tasks/main.yml
+#
+# Baseline config applied to a fresh Proxmox host via SSH (root), before
+# the Ansible API token exists. Safe to re-run — every task is idempotent.
+#
+# Assumes Proxmox 9+ (deb822 .sources repo format). If you ever provision
+# an older Proxmox 8 host, the enterprise repo will be in legacy .list
+# format instead and these disable tasks won't find it — handle manually
+# or re-add a .list-format fallback at that point.
+
+- name: Check if pve-enterprise.sources exists
+  ansible.builtin.stat:
+    path: /etc/apt/sources.list.d/pve-enterprise.sources
+  register: pve_enterprise_sources
+
+- name: Disable the pve-enterprise repo (deb822 .sources format, Proxmox 9+)
+  ansible.builtin.command: >
+    mv /etc/apt/sources.list.d/pve-enterprise.sources
+    /etc/apt/sources.list.d/pve-enterprise.sources.disabled
+  when: pve_enterprise_sources.stat.exists
+
+- name: Check if ceph.sources exists
+  ansible.builtin.stat:
+    path: /etc/apt/sources.list.d/ceph.sources
+  register: ceph_sources
+
+- name: Disable the enterprise Ceph repo (deb822 .sources format, Proxmox 9+)
+  ansible.builtin.command: >
+    mv /etc/apt/sources.list.d/ceph.sources
+    /etc/apt/sources.list.d/ceph.sources.disabled
+  when: ceph_sources.stat.exists
+
+- name: Add the pve-no-subscription repo
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/pve-no-subscription.list
+    content: "deb http://download.proxmox.com/debian/pve trixie pve-no-subscription\n"
+    mode: '0644'
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+
+- name: Install libguestfs-tools (needed for virt-customize / golden template builds)
+  ansible.builtin.apt:
+    name: libguestfs-tools
+    state: present
+
+- name: Cap ZFS ARC max size (16GB host — leave headroom for VMs)
+  ansible.builtin.lineinfile:
+    path: /etc/modprobe.d/zfs.conf
+    line: "options zfs zfs_arc_max=2147483648"
+    create: true
+    mode: '0644'
+  register: zfs_arc_conf
+
+- name: Update initramfs if ZFS ARC config changed
+  ansible.builtin.command: update-initramfs -u
+  when: zfs_arc_conf.changed
+
+- name: Notify if reboot is needed for ARC change to take effect
+  ansible.builtin.debug:
+    msg: "ZFS ARC max size config changed — reboot pve-01 for this to take effect."
+  when: zfs_arc_conf.changed
+
+# --- Proxmox API user/role/token for Ansible ---
+# Idempotent: checks for existing role/user before creating, and only
+# generates (and displays) a token secret if one doesn't already exist.
+# pveum has no clean "does this exist" exit code, so we grep its list output.
+
+- name: Check if AnsibleProvisioner role already exists
+  ansible.builtin.command: pveum role list
+  register: pveum_role_list
+  changed_when: false
+
+- name: Create AnsibleProvisioner role
+  ansible.builtin.command: >
+    pveum role add AnsibleProvisioner -privs
+    "VM.Allocate,VM.Clone,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.PowerMgmt,Datastore.AllocateSpace,Sys.Audit"
+  when: "'AnsibleProvisioner' not in pveum_role_list.stdout"
+
+- name: Check if ansible@pve user already exists
+  ansible.builtin.command: pveum user list
+  register: pveum_user_list
+  changed_when: false
+
+- name: Create ansible@pve user
+  ansible.builtin.command: pveum user add ansible@pve
+  when: "'ansible@pve' not in pveum_user_list.stdout"
+
+- name: Assign AnsibleProvisioner role to ansible@pve on /
+  ansible.builtin.command: pveum aclmod / -user ansible@pve -role AnsibleProvisioner
+  changed_when: false  # aclmod is idempotent server-side; always safe to re-run
+
+- name: Check if provisioning-token already exists
+  ansible.builtin.command: pveum user token list ansible@pve
+  register: pveum_token_list
+  changed_when: false
+  failed_when: false  # fails harmlessly if user has zero tokens on some versions
+
+- name: Create provisioning-token (only if it doesn't already exist)
+  ansible.builtin.command: pveum user token add ansible@pve provisioning-token --privsep 0 --output-format json
+  register: new_token
+  when: "'provisioning-token' not in pveum_token_list.stdout"
+
+- name: Display the new token secret — SAVE THIS, IT WILL NOT BE SHOWN AGAIN
+  ansible.builtin.debug:
+    msg: "{{ new_token.stdout }}"
+  when: new_token is defined and new_token.changed
+
+- name: Warn if token already existed (secret cannot be re-displayed)
+  ansible.builtin.debug:
+    msg: >
+      provisioning-token already exists for ansible@pve. If you don't have
+      the secret saved in secrets/vault.yml, you must delete and recreate it:
+      pveum user token remove ansible@pve provisioning-token
+      then re-run this playbook.
+  when: "'provisioning-token' in pveum_token_list.stdout"
+
+# --- ZFS mirror on the 2x 1TB spinning disks (bulk/backup storage) ---
+# DESTRUCTIVE on first run — wipes /dev/sda and /dev/sdb. Gated behind
+# create_bulk_storage_pool (default false) so it never runs by accident.
+# Run explicitly with:
+#   ansible-playbook ... -e create_bulk_storage_pool=true
+
+- name: Check if the 'tank' zpool already exists
+  ansible.builtin.command: zpool list tank
+  register: tank_pool_check
+  changed_when: false
+  failed_when: false
+  when: create_bulk_storage_pool | default(false) | bool
+
+- name: Create ZFS mirror 'tank' on the 1TB spinning disks
+  ansible.builtin.command: >
+    zpool create -f tank mirror {{ bulk_storage_disk_1 }} {{ bulk_storage_disk_2 }}
+  when:
+    - create_bulk_storage_pool | default(false) | bool
+    - tank_pool_check.rc != 0
+
+- name: Register 'tank' as a Proxmox storage target
+  ansible.builtin.command: >
+    pvesm add zfspool tank-storage -pool tank -content images,rootdir,backup,iso,vztmpl
+  register: pvesm_add_result
+  failed_when:
+    - pvesm_add_result.rc != 0
+    - "'already defined' not in pvesm_add_result.stderr"
+  when:
+    - create_bulk_storage_pool | default(false) | bool
+    - tank_pool_check.rc != 0
+
+# --- Wipe old mSATA install (leftover from a previous Proxmox install) ---
+# DESTRUCTIVE — wipes the partition table and old LVM structure on the
+# mSATA disk (sdc), including its old boot/EFI partition. Gated behind
+# wipe_msata_disk (default false). Run explicitly with:
+#   ansible-playbook ... -e wipe_msata_disk=true
+#
+# After wiping, the disk is left as raw unpartitioned space — what to do
+# with it (new ZFS pool for etcd/control-plane VM disks, or leave unused)
+# is a separate decision, not handled by this task.
+
+- name: Check if msata_disk variable's LVM volume group is still active (safety check)
+  ansible.builtin.command: vgs --noheadings -o vg_name
+  register: active_vgs
+  changed_when: false
+  failed_when: false
+  when: wipe_msata_disk | default(false) | bool
+
+- name: Deactivate old 'pve' volume group on mSATA disk, if present
+  ansible.builtin.command: vgchange -an pve
+  when:
+    - wipe_msata_disk | default(false) | bool
+    - "'pve' in active_vgs.stdout"
+  failed_when: false
+
+- name: Wipe partition table and filesystem signatures on mSATA disk
+  ansible.builtin.command: wipefs -a {{ msata_disk }}
+  when: wipe_msata_disk | default(false) | bool
+
+- name: Zero out the start of the mSATA disk (removes old boot/EFI remnants)
+  ansible.builtin.command: dd if=/dev/zero of={{ msata_disk }} bs=1M count=10
+  when: wipe_msata_disk | default(false) | bool
+
+- name: Inform user the mSATA disk is wiped and ready for repurposing
+  ansible.builtin.debug:
+    msg: >
+      {{ msata_disk }} wiped — old mSATA Proxmox install removed.
+      Disk is now raw unpartitioned space. Decide separately whether to
+      create a new ZFS pool here (e.g. for etcd/control-plane VM disks)
+      or leave it unused for now.
+  when: wipe_msata_disk | default(false) | bool
+
+# --- ZFS pool on the mSATA disk (single disk, no redundancy) ---
+# Used for the golden template + general fast-but-not-NVMe VM storage.
+# Gated behind create_msata_pool (default false). Run explicitly with:
+#   ansible-playbook ... -e create_msata_pool=true
+# Requires the disk to already be wiped (run with wipe_msata_disk=true
+# first, on a separate invocation, if not already done).
+
+- name: Check if the 'fastpool' zpool already exists
+  ansible.builtin.command: zpool list fastpool
+  register: fastpool_check
+  changed_when: false
+  failed_when: false
+  when: create_msata_pool | default(false) | bool
+
+- name: Create single-disk ZFS pool on the mSATA disk
+  ansible.builtin.command: >
+    zpool create -f fastpool {{ msata_disk }}
+  when:
+    - create_msata_pool | default(false) | bool
+    - fastpool_check.rc != 0
+
+- name: Register 'fastpool' as a Proxmox storage target
+  ansible.builtin.command: >
+    pvesm add zfspool fastpool-storage -pool fastpool -content images,rootdir
+  register: fastpool_pvesm_result
+  failed_when:
+    - fastpool_pvesm_result.rc != 0
+    - "'already defined' not in fastpool_pvesm_result.stderr"
+  when:
+    - create_msata_pool | default(false) | bool
+    - fastpool_check.rc != 0
+
+- name: Inform user the mSATA pool is ready
+  ansible.builtin.debug:
+    msg: >
+      fastpool-storage is now available as a Proxmox storage target on
+      {{ msata_disk }}. NOTE: single disk, no redundancy — if this disk
+      fails, anything stored here is lost. Suitable for the golden
+      template and other easily-recreatable VMs, not for anything
+      irreplaceable.
+  when:
+    - create_msata_pool | default(false) | bool
+    - fastpool_check.rc != 0

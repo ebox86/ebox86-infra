@@ -1,0 +1,162 @@
+---
+# vars/network_vlans.yml
+#
+# VLAN definitions and CX 6000 port assignments for the ebox86 homelab.
+# Subnet scheme: 10.<vlan_id>.0.0/24 — VLAN ID matches third octet.
+#
+# IP MIGRATION NOTE: existing hosts (pve-01 at 10.0.0.10, etc.) keep their
+# current IPs on VLAN 1 until the Aruba 9004 GW is up and doing inter-VLAN
+# routing + DHCP. At that point migrate per playbook 33_migrate_host_ips.yml.
+
+vlans:
+  - id: 10
+    name: mgmt
+    description: "Management — switch, iLO, AP mgmt, Proxmox host NIC"
+    subnet: "10.10.0.0/24"
+    gateway: "10.10.0.1"
+  - id: 20
+    name: infra
+    description: "Infrastructure — DNS, Cloudflared, VMs, NFS storage"
+    subnet: "10.20.0.0/24"
+    gateway: "10.20.0.1"
+  - id: 30
+    name: okd
+    description: "OKD cluster — control plane VM + bare metal workers"
+    subnet: "10.0.1.0/24"    # exception: pre-provisioned before 10.<vlan>.0.x scheme; changing requires full cluster reprovision
+    gateway: "10.0.1.1"
+  - id: 40
+    name: trusted
+    description: "Trusted WiFi — personal devices and laptops"
+    subnet: "10.40.0.0/24"
+    gateway: "10.40.0.1"
+  - id: 50
+    name: iot
+    description: "IoT / smart home — isolated from infra"
+    subnet: "10.50.0.0/24"
+    gateway: "10.50.0.1"
+  - id: 60
+    name: guest
+    description: "Guest WiFi — internet only, no LAN access"
+    subnet: "10.60.0.0/24"
+    gateway: "10.60.0.1"
+  - id: 70
+    name: cameras
+    description: "Security cameras — fully isolated (Axis)"
+    subnet: "10.70.0.0/24"
+    gateway: "10.70.0.1"
+
+# ---------------------------------------------------------------------------
+# CX 6000 port assignments
+#
+# Layout: grouped by VLAN in ascending order. Ports 13-16 are uplinks/spare.
+#
+# AP mesh:
+#   AP-1 (mesh portal) — wired via PoE on port 1/1/10, carries WiFi VLANs 40/50/60
+#   AP-2 (mesh point)  — power adapter only, wireless backhaul to AP-1, NOT on switch
+#
+#   VLAN 10 — mgmt (1-4)         VLAN 20 — storage/infra (5-7)
+#   1  — pve-01 mgmt NIC (trunk) 5  — pve-01 VM data NIC (trunk)
+#   2  — pve-01 iLO               6  — ml350-01 storage NIC (NFS)
+#   3  — ml350-01 iLO             7  — ml350-02 storage NIC (NFS)
+#   4  — ml350-02 iLO
+#
+#   VLAN 30 — OKD (8-9)          VLAN 40/50/60 — WiFi (10)
+#   8  — ml350-01 data NIC        10 — 505 AP-1 mesh portal (PoE, trunk)
+#   9  — ml350-02 data NIC
+#
+#   VLAN 70 — cameras (11-12)    Uplinks (13-16, fixed)
+#   11 — Axis camera 1            13 — 9004 GW LAN (copper TRUNK, native VLAN 1)
+#   12 — Axis camera 2            14 — in-wall switch → apt wall outlets (VLAN 40)
+#                                 15 — 9004 GW LAN (SFP — needs module)
+#                                 16 — SFP spare
+#
+# Physical repatch from original cabling:
+#   Port 3: was ml350-01 data → becomes ml350-01 iLO  (move from port 4)
+#   Port 4: was ml350-01 iLO  → becomes ml350-02 iLO  (move from port 6)
+#   Port 5: was ml350-02 data → becomes pve-01 VM data NIC  (new cable)
+#   Port 6: was ml350-02 iLO  → becomes ml350-01 storage NIC  (new cable)
+#   Port 7: was AP-1           → becomes ml350-02 storage NIC  (new cable)
+#   Port 8: was KVM            → REMOVE; becomes ml350-01 data NIC  (move from port 3)
+#   Port 9: was camera 1       → becomes ml350-02 data NIC  (move from port 5)
+#   Port 10: was camera 2      → becomes AP-1  (move from port 7)
+#   Port 11: (was planned NIC) → becomes camera 1  (move from port 9)
+#   Port 12: (was planned NIC) → becomes camera 2  (move from port 10)
+#   Port 14: Xfinity WAN moves to 9004 GE0/0/0 → port 14 becomes spare
+# ---------------------------------------------------------------------------
+
+cx6000_trunk_ports:
+  - interface: "1/1/1"
+    description: "pve-01 mgmt NIC"
+    native_vlan: 1          # native VLAN 1 keeps 10.0.0.10 working during transition
+    allowed_vlans: [1, 10]
+  - interface: "1/1/5"
+    description: "pve-01 VM data NIC (VLAN-aware bridge)"
+    native_vlan: 20
+    allowed_vlans: [10, 20, 30, 40, 50, 60, 70]  # all LAN VLANs — DHCP LXC on vmbr0 serves 10-70
+  - interface: "1/1/10"
+    description: "505 AP-1 (mesh portal, PoE)"
+    native_vlan: 10              # AP management on VLAN 10 (10.10.0.251 static)
+    allowed_vlans: [10, 40, 50, 60]  # bridge-mode SSIDs: trusted=40, iot=50, guest=60
+  - interface: "1/1/13"
+    description: "9004 GW LAN trunk (native 1, all LAN VLANs tagged)"
+    native_vlan: 1
+    allowed_vlans: [1, 10, 20, 30, 40, 50, 60, 70]
+
+cx6000_access_ports:
+  - interface: "1/1/2"
+    description: "pve-01 iLO"
+    vlan: 10
+  - interface: "1/1/3"
+    description: "ml350-01 iLO (worker-01)"
+    vlan: 10
+  - interface: "1/1/4"
+    description: "ml350-02 iLO (worker-02)"
+    vlan: 10
+  - interface: "1/1/6"
+    description: "ml350-01 storage NIC (NFS to pve-01)"
+    vlan: 20
+  - interface: "1/1/7"
+    description: "ml350-02 storage NIC (NFS to pve-01)"
+    vlan: 20
+  - interface: "1/1/8"
+    description: "ml350-01 data NIC (OKD worker-01)"
+    vlan: 30
+  - interface: "1/1/9"
+    description: "ml350-02 data NIC (OKD worker-02)"
+    vlan: 30
+  - interface: "1/1/11"
+    description: "Axis camera 1"
+    vlan: 70
+  - interface: "1/1/12"
+    description: "Axis camera 2"
+    vlan: 70
+  - interface: "1/1/14"
+    description: "In-wall switch — apartment wall outlets (trusted)"
+    vlan: 40
+
+# Proxmox SDN — VNets created per VLAN (maps to vmbr0 VLAN-aware bridge)
+proxmox_sdn:
+  zone: lab
+  bridge: vmbr0
+  vnets:
+    - name: mgmt
+      vlan: 10
+      alias: "VLAN 10 - Management"
+    - name: infra
+      vlan: 20
+      alias: "VLAN 20 - Infrastructure"
+    - name: okd
+      vlan: 30
+      alias: "VLAN 30 - OKD Cluster"
+    - name: trusted
+      vlan: 40
+      alias: "VLAN 40 - Trusted WiFi"
+    - name: iot
+      vlan: 50
+      alias: "VLAN 50 - IoT"
+    - name: guest
+      vlan: 60
+      alias: "VLAN 60 - Guest WiFi"
+    - name: cameras
+      vlan: 70
+      alias: "VLAN 70 - Cameras"

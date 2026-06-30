@@ -1,0 +1,25 @@
+# PowerDNS Recursor — managed by Ansible, do not edit manually.
+# Restart container to pick up changes: docker compose restart pdns-recursor
+
+# Listen on all interfaces, port 53 (mapped to host 0.0.0.0:53)
+local-address=0.0.0.0
+local-port=53
+
+# Allow queries from RFC1918 and loopback only
+allow-from=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8
+
+# Split DNS:
+#   Internal zones → pdns-auth (172.20.0.10 — fixed IP on pdns Docker bridge)
+#   Everything else → upstream resolvers (Cloudflare) with full recursion
+#
+# ebox86.com is a real public domain (Cloudflare), so pdns-auth is authoritative
+# only for the private split view. lab.ebox86.com is a separate private-only zone
+# and must be listed explicitly — the ebox86.com forward does not cover sub-zones.
+forward-zones={{ search_domain }}.=172.20.0.10:53,lab.{{ search_domain }}.=172.20.0.10:53
+forward-zones-recurse=.={{ upstream_dns | join(';') }}
+
+# Performance
+threads=2
+max-cache-entries=200000
+
+loglevel=4

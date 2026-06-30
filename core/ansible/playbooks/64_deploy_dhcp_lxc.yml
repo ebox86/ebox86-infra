@@ -1,0 +1,236 @@
+---
+# playbooks/64_deploy_dhcp_lxc.yml
+#
+# Provisions dhcp-01 from the golden VM template (VMID 9000) and configures
+# it as the authoritative DHCP server for all LAN VLANs (10-70).
+#
+# Why this exists:
+#   The Aruba 9004 lacks enterprise licenses. ArubaOS blocks the `range`
+#   subcommand in `ip dhcp pool` without a license, so the controller can
+#   define pools but never allocates addresses. This VM fills that gap.
+#
+# Architecture:
+#   dhcp-01 has 7 VLAN-tagged virtio interfaces on vmbr1 — one per LAN VLAN.
+#   vmbr1 uses nic2 (enp2s0f2) → CX 6000 port 1/1/5 (trunk, all VLANs 10-70).
+#   vmbr0 (nic0 → port 1/1/1) is left for pve-01 management + existing VMs.
+#   dnsmasq listens on each interface's static IP and serves DHCP.
+#   The 9004 remains the L3 default gateway (10.x.0.1) for every VLAN.
+#
+# Prerequisites:
+#   - playbook 03_build_golden_template.yml has been run (VMID 9000 exists)
+#   - playbook 63_configure_proxmox_sdn.yml has been run (vmbr0 VLAN-aware)
+#   - CX 6000 port 1/1/5 allows VLANs 10-70 (vars/network_vlans.yml updated,
+#     playbook 61 re-run)
+#   - 9004 is up and doing inter-VLAN routing (Ansible reaches 10.10.0.5 from
+#     the control machine via the 9004)
+#
+# VM network layout (net0 = management/default-route):
+#   net0  VLAN 10  10.10.0.5/24  gw 10.10.0.1  (management, default route)
+#   net1  VLAN 20  10.20.0.5/24
+#   net2  VLAN 30  10.30.0.5/24
+#   net3  VLAN 40  10.40.0.5/24
+#   net4  VLAN 50  10.50.0.5/24
+#   net5  VLAN 60  10.60.0.5/24
+#   net6  VLAN 70  10.70.0.5/24
+#
+# DHCP ranges: 10.x.0.50 – 10.x.0.250 (excludes .1 gateway and .5 server)
+#
+# Usage:
+#   ansible-playbook playbooks/64_deploy_dhcp_lxc.yml \
+#     -i inventory/production/hosts.yml \
+#     --vault-password-file ~/.vault_pass.txt
+#
+# To re-push dnsmasq config only (no VM rebuild):
+#   ansible-playbook playbooks/64_deploy_dhcp_lxc.yml -t dnsmasq \
+#     -i inventory/production/hosts.yml
+
+# =============================================================================
+# PLAY 1 — Proxmox host: clone golden template, configure 7 VLAN interfaces
+# =============================================================================
+
+- name: Provision dhcp-01 VM from golden template
+  hosts: proxmox
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../vars/network_vlans.yml
+    - ../vars/network_topology.yml
+  vars:
+    vm_id: 210
+    vm_name: dhcp-01
+    vm_storage: local-zfs
+    vm_cores: 1
+    vm_memory_mb: 512
+    vm_ciuser: ansible
+    ssh_pubkey_local_path: "~/.ssh/ebox86_ansible_ed25519.pub"
+    dhcp_vm_ip_suffix: "5"         # 10.x.0.5 per VLAN
+    dhcp_bridge: vmbr1             # nic2 → port 1/1/5 (all VLANs); vmbr0/nic0 is management only
+  tags: [provision]
+
+  tasks:
+
+    - name: Check if VMID {{ vm_id }} already exists
+      ansible.builtin.command: qm status {{ vm_id }}
+      register: _vm_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Clone golden template into dhcp-01
+      ansible.builtin.command: >
+        qm clone {{ template_vmid }} {{ vm_id }}
+        --name {{ vm_name }}
+        --full true
+        --storage {{ vm_storage }}
+      when: _vm_exists.rc != 0
+
+    - name: Configure cores and memory
+      ansible.builtin.command: >
+        qm set {{ vm_id }}
+        --cores {{ vm_cores }}
+        --memory {{ vm_memory_mb }}
+      when: _vm_exists.rc != 0
+
+    - name: Configure VLAN-tagged network interfaces (net0–net6)
+      ansible.builtin.command: >
+        qm set {{ vm_id }}
+        --net{{ ansible_loop.index0 }} virtio,bridge={{ dhcp_bridge }},tag={{ item.id }}
+      loop: "{{ vlans }}"
+      loop_control:
+        extended: true
+        label: "VLAN {{ item.id }}"
+
+    - name: Configure cloud-init IP for net0 (management, with default gateway)
+      ansible.builtin.command: >
+        qm set {{ vm_id }}
+        --ipconfig0 ip={{ vlans[0].gateway | regex_replace('\.1$', '.' + dhcp_vm_ip_suffix) }}/24,gw={{ vlans[0].gateway }}
+      when: _vm_exists.rc != 0
+
+    - name: Configure cloud-init IPs for net1–net6 (no gateway)
+      ansible.builtin.command: >
+        qm set {{ vm_id }}
+        --ipconfig{{ ansible_loop.index }} ip={{ item.gateway | regex_replace('\.1$', '.' + dhcp_vm_ip_suffix) }}/24
+      loop: "{{ vlans[1:] }}"
+      loop_control:
+        extended: true
+        label: "VLAN {{ item.id }} {{ item.gateway | regex_replace('\\.1$', '.' + dhcp_vm_ip_suffix) }}/24"
+      when: _vm_exists.rc != 0
+
+    - name: Set cloud-init nameserver (Cloudflare — pre dns-01)
+      ansible.builtin.command: >
+        qm set {{ vm_id }}
+        --nameserver "{{ upstream_dns | join(' ') }}"
+        --searchdomain {{ search_domain }}
+      when: _vm_exists.rc != 0
+
+    - name: Copy SSH public key to pve-01 for qm set --sshkey
+      ansible.builtin.copy:
+        src: "{{ ssh_pubkey_local_path }}"
+        dest: /root/.ssh/ansible_pubkey_for_clones.pub
+        mode: "0644"
+
+    - name: Configure cloud-init user and SSH key
+      ansible.builtin.command: >
+        qm set {{ vm_id }}
+        --ciuser {{ vm_ciuser }}
+        --sshkey /root/.ssh/ansible_pubkey_for_clones.pub
+      when: _vm_exists.rc != 0
+
+    - name: Enable autostart on host boot
+      ansible.builtin.command: >
+        qm set {{ vm_id }} --onboot 1
+
+    - name: Start dhcp-01
+      ansible.builtin.command: qm start {{ vm_id }}
+      register: _start
+      failed_when:
+        - _start.rc != 0
+        - "'already running' not in _start.stderr"
+      changed_when: _start.rc == 0
+
+    - name: Wait for SSH on dhcp-01 (10.10.0.5)
+      ansible.builtin.wait_for:
+        host: "{{ vlans[0].gateway | regex_replace('\\.1$', '.' + dhcp_vm_ip_suffix) }}"
+        port: 22
+        delay: 15
+        timeout: 180
+      delegate_to: localhost
+      become: false
+
+# =============================================================================
+# PLAY 2 — dhcp-01: install and configure dnsmasq
+# =============================================================================
+
+- name: Install and configure dnsmasq on dhcp-01
+  hosts: dhcp_servers
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../vars/network_vlans.yml
+    - ../vars/wireless.yml      # provides dhcp_static_hosts (AP MAC reservations)
+  vars:
+    dhcp_vm_ip_suffix: "5"
+  tags: [dnsmasq]
+
+  tasks:
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install dnsmasq
+      ansible.builtin.apt:
+        name: dnsmasq
+        state: present
+
+    - name: Deploy dnsmasq.conf
+      ansible.builtin.template:
+        src: templates/dnsmasq.conf.j2
+        dest: /etc/dnsmasq.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart dnsmasq
+
+    - name: Enable and start dnsmasq
+      ansible.builtin.service:
+        name: dnsmasq
+        enabled: true
+        state: started
+
+    - name: Verify dnsmasq is active
+      ansible.builtin.command: systemctl is-active dnsmasq
+      register: _dnsmasq_status
+      failed_when: _dnsmasq_status.stdout != 'active'
+      changed_when: false
+
+    - name: Post-deploy summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          dhcp-01 (VMID 210) — dnsmasq DHCP server active
+          ============================================================
+
+          VM IPs:
+          {% for vlan in vlans %}
+            net{{ loop.index0 }}  VLAN {{ vlan.id }}  {{ vlan.gateway | regex_replace('\.1$', '.' + dhcp_vm_ip_suffix) }}/24  ({{ vlan.name }})
+          {% endfor %}
+
+          Default gateway: {{ vlans[0].gateway }} (9004 VLAN {{ vlans[0].id }} SVI)
+
+          DHCP ranges:
+          {% for vlan in vlans %}
+            {{ vlan.name }}: {{ vlan.gateway | regex_replace('\.1$', '.50') }} – {{ vlan.gateway | regex_replace('\.1$', '.250') }}  gw={{ vlan.gateway }}
+          {% endfor %}
+
+          dnsmasq: {{ _dnsmasq_status.stdout }}
+
+          To re-push config:
+            ansible-playbook playbooks/64_deploy_dhcp_lxc.yml -t dnsmasq
+          ============================================================
+
+  handlers:
+    - name: restart dnsmasq
+      ansible.builtin.service:
+        name: dnsmasq
+        state: restarted

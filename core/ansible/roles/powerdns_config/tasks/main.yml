@@ -1,0 +1,173 @@
+---
+# roles/powerdns_config/tasks/main.yml
+#
+# Configures PowerDNS Authoritative Server after the container is running.
+# Creates the forward zone, reverse zone for the infra /24, and manages
+# A + PTR records from vars/network_topology.yml.
+#
+# Required vars:
+#   pdns_api_key   — PowerDNS REST API key (vault)
+#   search_domain  — internal DNS suffix (e.g. ebox86.com)
+#   upstream_dns   — upstream forwarders
+#   infra_hosts, network_hosts, ilo_hosts — from network_topology.yml
+# Optional vars:
+#   dns_record_ttl — TTL for managed records, defaults to 3600
+#
+# PTR records are created for hosts in the infra /24 (10.0.0.0/24).
+# VLAN subnet reverse zones (10.x.0.0/24) are auto-managed by Proxmox SDN.
+
+- name: Validate required PowerDNS config variables
+  ansible.builtin.assert:
+    that:
+      - pdns_api_key is defined
+      - pdns_api_key | length > 0
+      - search_domain is defined
+      - upstream_dns is defined
+    fail_msg: >
+      powerdns_config requires pdns_api_key, search_domain, and upstream_dns.
+  no_log: true
+
+- name: Wait for PowerDNS API to be available
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8081/api/v1/servers/localhost
+    headers:
+      X-API-Key: "{{ pdns_api_key }}"
+    status_code: 200
+  register: _pdns_api
+  until: _pdns_api.status == 200
+  retries: 18
+  delay: 5
+  no_log: true
+
+- name: Build full managed DNS record list (A records — includes service vhosts)
+  ansible.builtin.set_fact:
+    pdns_records: >-
+      {{
+        (network_hosts | default({}) | dict2items | map(attribute='value') | list)
+        +
+        (infra_hosts | default({}) | dict2items | map(attribute='value') | list)
+        +
+        (ilo_hosts | default({}) | dict2items | map(attribute='value') | list)
+        +
+        (service_hosts | default({}) | dict2items | map(attribute='value') | list)
+      }}
+
+- name: Build PTR-eligible record list (real hosts only — excludes service vhosts)
+  ansible.builtin.set_fact:
+    pdns_ptr_eligible: >-
+      {{
+        (network_hosts | default({}) | dict2items | map(attribute='value') | list)
+        +
+        (infra_hosts | default({}) | dict2items | map(attribute='value') | list)
+        +
+        (ilo_hosts | default({}) | dict2items | map(attribute='value') | list)
+      }}
+
+# ---------------------------------------------------------------------------
+# Forward zone: ebox86.com
+# ---------------------------------------------------------------------------
+
+- name: Create forward zone {{ search_domain }}
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8081/api/v1/servers/localhost/zones
+    method: POST
+    headers:
+      X-API-Key: "{{ pdns_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "{{ search_domain }}."
+      kind: Native
+      nameservers: []
+      rrsets: []
+    status_code: [201, 409, 422]   # 409/422 = zone already exists (varies by pdns version)
+  no_log: true
+
+- name: Add A records to {{ search_domain }}
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:8081/api/v1/servers/localhost/zones/{{ search_domain }}."
+    method: PATCH
+    headers:
+      X-API-Key: "{{ pdns_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      rrsets:
+        - name: "{{ item.hostname }}.{{ search_domain }}."
+          type: A
+          ttl: "{{ dns_record_ttl | default(3600) }}"
+          changetype: REPLACE
+          records:
+            - content: "{{ item.ip }}"
+              disabled: false
+    status_code: 204
+  loop: "{{ pdns_records }}"
+  loop_control:
+    label: "{{ item.hostname }}.{{ search_domain }} -> {{ item.ip }}"
+  no_log: true
+
+# ---------------------------------------------------------------------------
+# Reverse zone: 0.0.10.in-addr.arpa (infra /24 only)
+# VLAN reverse zones (0.x.10.in-addr.arpa) are managed by Proxmox SDN plugin.
+# ---------------------------------------------------------------------------
+
+- name: Create reverse zone 0.0.10.in-addr.arpa
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8081/api/v1/servers/localhost/zones
+    method: POST
+    headers:
+      X-API-Key: "{{ pdns_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "0.0.10.in-addr.arpa."
+      kind: Native
+      nameservers: []
+      rrsets: []
+    status_code: [201, 409, 422]
+  no_log: true
+
+- name: Build infra PTR record list (10.0.0.0/24 real hosts only — no service vhosts)
+  ansible.builtin.set_fact:
+    pdns_ptr_records: >-
+      {{
+        pdns_ptr_eligible
+        | selectattr('ip', 'match', '^10[.]0[.]0[.]')
+        | list
+      }}
+
+- name: Add PTR records to 0.0.10.in-addr.arpa
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:8081/api/v1/servers/localhost/zones/0.0.10.in-addr.arpa."
+    method: PATCH
+    headers:
+      X-API-Key: "{{ pdns_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      rrsets:
+        - name: "{{ item.ip.split('.') | reverse | list | join('.') }}.in-addr.arpa."
+          type: PTR
+          ttl: "{{ dns_record_ttl | default(3600) }}"
+          changetype: REPLACE
+          records:
+            - content: "{{ item.hostname }}.{{ search_domain }}."
+              disabled: false
+    status_code: 204
+  loop: "{{ pdns_ptr_records }}"
+  loop_control:
+    label: "{{ item.ip }} -> {{ item.hostname }}.{{ search_domain }}"
+  no_log: true
+
+- name: Display PowerDNS record summary
+  ansible.builtin.debug:
+    msg: |
+      PowerDNS records configured.
+
+      Forward zone: {{ search_domain }}
+      {% for r in pdns_records %}
+        {{ r.hostname }}.{{ search_domain }}  ->  {{ r.ip }}
+      {% endfor %}
+
+      Reverse zone: 0.0.10.in-addr.arpa ({{ pdns_ptr_records | length }} PTR records)
+      VLAN reverse zones are auto-managed by Proxmox SDN DNS plugin.

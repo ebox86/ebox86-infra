@@ -1,0 +1,26 @@
+# PowerDNS Authoritative Server — managed by Ansible, do not edit manually.
+# Restart container to pick up changes: docker compose restart pdns-auth
+
+# Backend: SQLite3 (sufficient for homelab scale)
+launch=gsqlite3
+gsqlite3-database=/var/lib/powerdns/pdns.sqlite3
+
+# REST API — used by Proxmox SDN DNS plugin and Ansible record management
+api=yes
+api-key={{ pdns_api_key }}
+webserver=yes
+webserver-address=0.0.0.0
+webserver-port=8081
+webserver-allow-from=0.0.0.0/0
+
+# Listen on all interfaces inside the container.
+# Host mapping: 127.0.0.1:5300 (so port 53 on the host is owned by pdns-recursor).
+local-address=0.0.0.0
+local-port=53
+
+# Authoritative-only — no recursion
+disable-axfr=yes
+
+default-ttl=3600
+loglevel=4
+log-dns-details=no

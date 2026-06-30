@@ -1,0 +1,94 @@
+---
+# roles/okd_assisted_installer/tasks/main.yml
+#
+# Deploy OKD Assisted Installer as a container on a dedicated VM.
+# Exposes web UI on port 8080 for cluster configuration.
+
+- name: Install prerequisite packages for Assisted Installer
+  ansible.builtin.apt:
+    name:
+      - podman
+      - podman-compose
+      - git
+      - curl
+      - jq
+      - python3-netaddr
+    state: present
+    update_cache: yes
+
+- name: Create OKD directory structure
+  ansible.builtin.file:
+    path: "/opt/okd/{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "assisted-installer"
+    - "cluster-config"
+    - "iso-cache"
+
+- name: Deploy Assisted Installer compose file
+  ansible.builtin.template:
+    src: "docker-compose-assisted-installer.yml.j2"
+    dest: "/opt/okd/assisted-installer/docker-compose.yml"
+    mode: '0644'
+
+- name: Create .env file for Assisted Installer
+  ansible.builtin.template:
+    src: "assisted-installer.env.j2"
+    dest: "/opt/okd/assisted-installer/.env"
+    mode: '0600'
+
+- name: Remove any existing Assisted Installer containers (ensures clean restart)
+  ansible.builtin.shell: |
+    cd /opt/okd/assisted-installer
+    podman-compose down --remove-orphans
+  register: ai_down
+  changed_when: true
+  failed_when: false
+
+- name: Start Assisted Installer container
+  ansible.builtin.shell: |
+    cd /opt/okd/assisted-installer
+    podman-compose up -d
+  register: ai_start
+  changed_when: true
+
+- name: Wait for Assisted Installer API to be ready
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 8090
+    timeout: 300
+    state: started
+
+- name: Create cluster config template directory
+  ansible.builtin.file:
+    path: "/opt/okd/cluster-config"
+    state: directory
+    mode: '0755'
+
+- name: Generate cluster configuration template
+  ansible.builtin.template:
+    src: "okd-cluster-config.yml.j2"
+    dest: "/opt/okd/cluster-config/cluster-config.yml"
+    mode: '0644'
+
+- name: Display Assisted Installer access information
+  ansible.builtin.debug:
+    msg: |
+      OKD Assisted Installer is running!
+      
+      Web UI: {{ okd_assisted_installer.ui_url }}
+      
+      Access this URL in your browser to configure the cluster.
+      
+      Configuration template generated at: /opt/okd/cluster-config/cluster-config.yml
+      
+      Next steps:
+      1. Open the Assisted Installer web UI
+      2. Create a new cluster
+      3. Fill in cluster details (use cluster-config.yml as reference)
+      4. Add the control plane node (okd-control-0 at 10.0.1.10)
+      5. Add worker nodes (okd-worker-0, okd-worker-1 from ml350s)
+      6. Generate discovery ISOs
+      7. Boot cluster nodes with the ISOs
+      8. Watch the installation progress in the UI

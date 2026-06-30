@@ -1,0 +1,415 @@
+---
+# playbooks/60_configure_9004_base.yml
+#
+# Configures Aruba 9004 MC as the homelab gateway via REST API (port 4343).
+#
+# WHY REST API: ansible.builtin.raw over paramiko does not apply commands on
+# ArubaOS 8 — the CLI requires an interactive PTY session that the raw module
+# does not provide.
+#
+# API endpoint: POST https://<host>:4343/v1/configuration/object
+#               ?config_path=%2Fmm   (SESSION cookie in header handles auth)
+#
+# Schema source: device Swagger at https://10.0.0.254:4343/api/
+# [CONFIRMED] = verified from device Swagger
+# [INFERRED]  = not yet verified — check Swagger if task fails
+#
+# Usage:
+#   ansible-playbook playbooks/60_configure_9004_base.yml
+
+- name: Configure Aruba 9004 MC base configuration
+  hosts: aruba_mc
+  gather_facts: false
+  connection: local          # REST API via HTTP — no SSH to device
+  module_defaults:
+    ansible.builtin.uri:
+      validate_certs: false
+      headers:
+        Cookie: "SESSION={{ _session | default('') }}"
+        X-CSRF-Token: "{{ _csrf | default('') }}"
+  vars_files:
+    - ../vars/network_topology.yml
+    - ../vars/network_vlans.yml
+    - ../secrets/vault.yml
+  vars:
+    _api: "https://{{ ansible_host }}:4343/v1"
+    _cfg: "/mm/mynode"
+    wan_vlan: 100
+    lan_mask: "255.255.255.0"
+    dns_primary: "8.8.8.8"
+    dns_secondary: "8.8.4.4"
+
+  tasks:
+
+    # =========================================================================
+    # AUTHENTICATE
+    # =========================================================================
+
+    - name: Login — obtain UIDARUBA session token
+      ansible.builtin.uri:
+        url: "{{ _api }}/api/login"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          username: "{{ ansible_user }}"
+          password: "{{ mc_admin_password }}"
+        validate_certs: false
+        status_code: 200
+      register: _login
+      no_log: true
+      failed_when: _login.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    - name: Store session tokens and build config URL
+      ansible.builtin.set_fact:
+        _session: "{{ _login.cookies.SESSION | default('') }}"
+        _csrf: "{{ _login.x_csrf_token | default('') }}"
+        _uid: "{{ _login.json._global_result.UIDARUBA }}"
+        _url: "{{ _api }}/configuration/object?config_path={{ _cfg | urlencode }}&UIDARUBA={{ _login.json._global_result.UIDARUBA }}"
+      no_log: true
+
+    - name: Debug — verify auth tokens captured from login (no passwords)
+      ansible.builtin.debug:
+        msg:
+          session_cookie_len: "{{ _session | length }}"
+          csrf_token_len: "{{ _csrf | length }}"
+          uidaruba_len: "{{ _uid | length }}"
+
+    # =========================================================================
+    # HOSTNAME  [CONFIRMED]
+    # =========================================================================
+
+    - name: Set hostname (gw-mc-01)
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          hostname:
+            hostname: gw-mc-01
+        validate_certs: false
+      register: _r
+      failed_when: >-
+        _r.json.get('_global_result', {}).get('status', 1) | int != 0
+        and 'in use' not in (_r.json.get('_global_result', {}).get('status_str', '') | lower)
+
+    # =========================================================================
+    # NTP  [CONFIRMED object + fqdn field]
+    # =========================================================================
+
+    - name: Configure NTP servers
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          _list:
+            - ntp_server_info:
+                fqdn: "0.pool.ntp.org"
+            - ntp_server_info:
+                fqdn: "1.pool.ntp.org"
+        validate_certs: false
+      register: _r
+      failed_when: _r.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    # =========================================================================
+    # GEOLOCATION  [CONFIRMED from device Swagger]
+    # Endpoint: /v1/configuration/object/geolocation (flat body, no wrapper)
+    # =========================================================================
+
+    - name: Set device geolocation (Pittsburgh, PA)
+      ansible.builtin.uri:
+        url: "{{ _api }}/configuration/object/geolocation?config_path={{ _cfg | urlencode }}&UIDARUBA={{ _uid }}"
+        method: POST
+        body_format: json
+        body:
+          latitude: "{{ geolocation_lat }}"
+          longitude: "{{ geolocation_lon }}"
+        validate_certs: false
+      register: _r
+      failed_when: _r.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    # =========================================================================
+    # VLANs  [CONFIRMED from device Swagger: vlan_id]
+    #
+    #   id                       → VLAN ID (integer 1–4094)
+    #   vlan_id__descr.descr     → VLAN description (there is NO "name" field)
+    # =========================================================================
+
+    - name: Create WAN VLAN 100
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          vlan_id:
+            id: "{{ wan_vlan }}"
+            vlan_id__descr:
+              descr: wan
+        validate_certs: false
+      register: _r
+      failed_when: _r.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    - name: Create LAN VLANs (10 / 20 / 30 / 40 / 50 / 60 / 70)
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          vlan_id:
+            id: "{{ item.id }}"
+            vlan_id__descr:
+              descr: "{{ item.name }}"
+        validate_certs: false
+      loop: "{{ vlans }}"
+      loop_control:
+        label: "VLAN {{ item.id }} — {{ item.name }}"
+      register: _r
+      failed_when: _r.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    # =========================================================================
+    # WAN PORT — GE0/0/1 → access VLAN 100
+    # GE0/0/0 is permanently admin-down due to unresolvable inherited config;
+    # WAN is on GE0/0/1 instead.
+    # Physical: GE0/0/1 → Xfinity modem (bridge/passthrough mode)
+    # [CONFIRMED from device Swagger int_gig schema]
+    # =========================================================================
+
+    - name: Configure GE0/0/1 as WAN access port (VLAN 100)
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          int_gig:
+            "slot/module/port": "0/0/1"
+            int_gig_desc:
+              LINE: "WAN - Xfinity bridge mode"
+            int_gig_mode:
+              port_mode: access
+            int_gig_access_vlan:
+              id: "{{ wan_vlan }}"
+        validate_certs: false
+      register: _r
+      failed_when: _r.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    # =========================================================================
+    # LAN TRUNK PORT — GE0/0/2 → trunk to CX 6000 port 1/1/13
+    # Native VLAN 1 (untagged); all LAN VLANs tagged.
+    # 9004 owns all VLAN SVIs and runs DHCP; CX 6000 is pure L2.
+    # Physical: GE0/0/2 → CX 6000 port 1/1/13
+    # [CONFIRMED mode field; int_gig_trunk_native_vlan / int_gig_trunk_allowed_vlan INFERRED]
+    # =========================================================================
+
+    - name: Configure GE0/0/2 as LAN trunk port (CX 6000 uplink, native VLAN 1)
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          int_gig:
+            "slot/module/port": "0/0/2"
+            int_gig_desc:
+              LINE: "LAN - CX 6000 trunk (native VLAN 1)"
+            int_gig_mode:
+              port_mode: trunk
+            int_gig_trunk_native_vlan:   # [INFERRED] verify at https://10.0.0.254:4343/api/
+              id: 1
+            int_gig_trunk_allowed_vlan:  # [INFERRED]
+              vlan_list: "1,10,20,30,40,50,60,70"
+        validate_certs: false
+      register: _r
+      ignore_errors: true  # trunk already configured; field names unverified — don't block VLAN SVI tasks
+
+    # =========================================================================
+    # MAC MANAGEMENT PORT — GE0/0/3 → access VLAN 1
+    # Dedicated direct-connect port for Mac laptop management access.
+    # Mac static IP: 10.0.0.100/24  gw: 10.0.0.254
+    # Physical: GE0/0/3 → Mac ethernet adapter (move cable here after pb60 run)
+    # =========================================================================
+
+    - name: Configure GE0/0/3 as Mac management access port (VLAN 1)
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          int_gig:
+            "slot/module/port": "0/0/3"
+            int_gig_desc:
+              LINE: "LAN - Mac direct management"
+            int_gig_mode:
+              port_mode: access
+            int_gig_access_vlan:
+              id: 1
+        validate_certs: false
+      register: _r
+      failed_when: _r.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    # =========================================================================
+    # VLAN INTERFACES  [CONFIRMED from device Swagger int_vlan schema]
+    #
+    #   int_vlan_ip.dhcp-client: true  → ip address dhcp-client
+    #   int_vlan_ip.ipaddr/ipmask      → static IP
+    #   int_vlan_nat: {}               → ip nat inside  (empty object = enabled)
+    #   ip_nat_outside: {}             → ip nat outside (empty object = enabled)
+    #   int_vlan_ip_helper[].address   → ip helper-address
+    #   int_vlan_desc.LINE             → interface description
+    # =========================================================================
+
+    - name: Configure VLAN 100 interface (WAN — DHCP from ISP + NAT outside)
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          int_vlan:
+            id: "{{ wan_vlan }}"
+            int_vlan_desc:
+              LINE: "WAN - ISP DHCP"
+            int_vlan_ip:
+              dhcp-client: true
+            ip_nat_outside: {}
+        validate_certs: false
+      register: _r
+      failed_when: _r.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    # 9004 owns all VLAN SVIs (1-70). No helper-address on LAN VLANs.
+    # DHCP is served by the dhcp-01 LXC (playbook 64) — the 9004 lacks licenses.
+    # Any manually-added static routes for VLANs 10-70 on the 9004 should be
+    # removed via CLI (they conflict with directly-connected SVI routes):
+    #   no ip route 10.10.0.0 255.255.255.0 10.0.0.250  (repeat for 20-70)
+    - name: Configure VLAN 1 interface (10.0.0.254/24 — gateway + NAT inside)
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          int_vlan:
+            id: 1
+            int_vlan_ip:
+              ipaddr: "10.0.0.254"
+              ipmask: "255.255.255.0"
+            int_vlan_nat: {}
+        validate_certs: false
+      register: _r
+      failed_when: _r.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    - name: Configure VLAN 10-70 interfaces (gateway IPs + NAT inside, no helper-address)
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          int_vlan:
+            id: "{{ item.id }}"
+            int_vlan_desc:
+              LINE: "{{ item.description }}"
+            int_vlan_ip:
+              ipaddr: "{{ item.gateway }}"
+              ipmask: "{{ lan_mask }}"
+            int_vlan_nat: {}
+        validate_certs: false
+      loop: "{{ vlans }}"
+      loop_control:
+        label: "VLAN {{ item.id }} {{ item.gateway }}/24 — {{ item.name }}"
+      register: _r
+      failed_when: >-
+        _r.json.get('_global_result', {}).get('status', 1) | int != 0
+        and 'inherited' not in (_r.json.get('_global_result', {}).get('status_str', '') | lower)
+
+    # =========================================================================
+    # DHCP: NOT configured on the 9004.
+    # The 9004 has zero enterprise licenses. ArubaOS blocks the `range`
+    # subcommand without a license, so pools are defined but never allocate
+    # addresses. DHCP is served by the dhcp-01 LXC container in Proxmox
+    # (playbook 64_deploy_dhcp_lxc.yml). The 9004 still owns all VLAN SVIs
+    # as default gateways (10.x.0.1) — clients receive those via DHCP option 3
+    # from dnsmasq.
+    # =========================================================================
+
+    # =========================================================================
+    # DEFAULT GATEWAY  [CONFIRMED from device Swagger: ip_def_gw_imp_dhcp]
+    #
+    # "ip default-gateway import dhcp" — tells the 9004 to use the default
+    # gateway it learns via DHCP on the WAN VLAN (100) as its own default
+    # route.  Body is an empty object {}.
+    #
+    # NAT: basic ip nat inside/outside (already set on int_vlan tasks above)
+    # is sufficient — no nat_pool or acl_sess needed.  Those require the
+    # PEFNG license which is not available on this device.
+    # =========================================================================
+
+    - name: Enable ip default-gateway import dhcp
+      ansible.builtin.uri:
+        url: "{{ _url }}"
+        method: POST
+        body_format: json
+        body:
+          ip_def_gw_imp_dhcp: {}
+        validate_certs: false
+      register: _r
+      failed_when: _r.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    # =========================================================================
+    # SAVE + LOGOUT
+    # =========================================================================
+
+    - name: Write memory (save configuration to flash)
+      ansible.builtin.uri:
+        url: "{{ _api }}/configuration/object/write_memory?config_path={{ _cfg | urlencode }}&UIDARUBA={{ _uid }}"
+        method: POST
+        body_format: json
+        body: {}
+        validate_certs: false
+        timeout: 120
+      register: _r
+      failed_when: >-
+        _r.status != -1
+        and _r.json.get('_global_result', {}).get('status', 1) | int != 0
+
+    - name: Logout
+      ansible.builtin.uri:
+        url: "{{ _api }}/api/logout?UIDARUBA={{ _uid }}"
+        method: GET
+      when: _uid is defined
+
+    - name: Post-configuration summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          9004 base configuration applied — gw-mc-01
+          ============================================================
+
+          WAN:      VLAN {{ wan_vlan }} on GE0/0/1 → dhcp-client + ip nat outside
+                    (GE0/0/0 is admin-down due to unresolvable inherited config — skipped)
+
+          LAN:      GE0/0/2 → CX 6000 port 1/1/13 (TRUNK, native VLAN 1)
+                    GE0/0/3 → Mac direct management (access VLAN 1)
+                    9004 owns all VLAN SVIs (1-70) — L3 router + NAT only
+                    DHCP served by dhcp-01 LXC in Proxmox (playbook 64)
+                    9004 has no enterprise license — ip dhcp pool range is blocked
+
+          GW:       ip default-gateway import dhcp — learns default route from
+                    DHCP lease on VLAN {{ wan_vlan }}
+
+          CLEANUP (if static routes exist on device from prior config):
+                    no ip route 10.10.0.0 255.255.255.0 10.0.0.250
+                    no ip route 10.20.0.0 255.255.255.0 10.0.0.250
+                    no ip route 10.30.0.0 255.255.255.0 10.0.0.250
+                    no ip route 10.40.0.0 255.255.255.0 10.0.0.250
+                    no ip route 10.50.0.0 255.255.255.0 10.0.0.250
+                    no ip route 10.60.0.0 255.255.255.0 10.0.0.250
+                    no ip route 10.70.0.0 255.255.255.0 10.0.0.250
+                    Also remove any helper-addresses on VLAN 10-70 SVIs if present:
+                    interface vlan 10 / no ip helper-address 10.0.0.254 (repeat 20-70)
+
+          NOTE: GE0/0/2 trunk fields (int_gig_trunk_native_vlan / int_gig_trunk_allowed_vlan)
+                are [INFERRED] — verify at https://10.0.0.254:4343/api/ if task fails.
+
+          ==================== NEXT STEPS ============================
+          1. Run CLEANUP CLI commands above if prior static routes exist
+          2. ansible-playbook playbooks/61_configure_switch.yml
+          3. ansible-playbook playbooks/63_configure_proxmox_sdn.yml
+          4. ansible-playbook playbooks/64_deploy_dhcp_lxc.yml
+          5. ansible-playbook playbooks/62_configure_ap.yml
+          ============================================================

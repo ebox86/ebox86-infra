@@ -1,0 +1,241 @@
+---
+# playbooks/62_configure_ap.yml
+#
+# Configures Aruba AP running AOS-8.x Instant mode (no controller).
+# ap-01 is the Virtual Controller (VC) — all config pushed directly to it.
+#
+# API notes (AOS-8 Instant mode — NOT the Mobility Controller v1 API):
+#   - Auth:   POST https://<ap>:4343/swarm.cgi  body: opcode=login&user=admin&passwd=<pw>&refresh=false
+#             Response: XML with <data name="sid">...</data>
+#   - Config: POST https://<ap>:4343/swarm.cgi  body: opcode=config&sid=<sid>&ip=127.0.0.1&cmd=<cli>&refresh=false
+#             Multi-line CLI: embed newlines in cmd (SSID profile sub-commands).
+#             Empty <re></re> response = success.
+#   - REST show (requires allow-rest-api):
+#             POST https://<ap>:4343/rest/login  JSON: {"user":"admin","passwd":"<pw>"}
+#             GET  https://<ap>:4343/rest/show-cmd?cmd=<encoded>&sid=<sid>&iap_ip_addr=127.0.0.1
+#
+# SSID → VLAN layout (bridge mode — Instant standalone, all traffic bridged):
+#   something_gay  → VLAN 40 (trusted)
+#   gay_iot        → VLAN 50 (iot)    [uncomment in wireless.yml to enable]
+#   gay_guest      → VLAN 60 (guest)  [uncomment in wireless.yml to enable]
+#
+# Prerequisites:
+#   1. playbook 61 complete — CX 6000 port 1/1/10 trunk (native 10, tagged 40/50/60)
+#   2. playbook 64 complete — dhcp-01 serving VLAN 10 (AP gets 10.10.0.251 static)
+#   3. AP booted with VC IP set: virtual-controller-ip 10.10.0.251
+#
+# One-time bootstrap (SSH to AP at its current DHCP IP, run before this playbook):
+#   configure terminal
+#   hostname ap-01
+#   virtual-controller-ip 10.10.0.251
+#   activate-disable
+#   allow-rest-api
+#   ntp-server 162.159.200.1
+#   commit apply
+#   write memory
+#   exit
+#
+# Run:
+#   ansible-playbook playbooks/62_configure_ap.yml \
+#     -i inventory/production/hosts.yml \
+#     --vault-password-file ~/.vault_pass.txt
+
+- name: Configure Aruba AP (ap-01) in Instant mode
+  hosts: aruba_aps
+  gather_facts: false
+  connection: local
+  vars_files:
+    - ../vars/wireless.yml
+    - ../secrets/vault.yml
+  vars:
+    _swarm_url: "https://{{ ansible_host }}:4343/swarm.cgi"
+
+  tasks:
+
+    # =========================================================================
+    # AUTHENTICATE via swarm.cgi (Instant AP native API)
+    # =========================================================================
+
+    - name: Login to swarm.cgi
+      ansible.builtin.uri:
+        url: "{{ _swarm_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          opcode: login
+          user: "{{ ansible_user | default('admin') }}"
+          passwd: "{{ ap_admin_password }}"
+          refresh: "false"
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      register: _login_resp
+      no_log: true
+
+    - name: Parse SID from login response
+      ansible.builtin.set_fact:
+        _sid: "{{ _login_resp.content | regex_search('<data name=\"sid\"[^>]*>([^<]+)<', '\\1') | first }}"
+      no_log: true
+
+    # =========================================================================
+    # HELPER — send a CLI config block to the AP via swarm.cgi
+    # Each task calls this with a multi-line cmd string.
+    # =========================================================================
+
+    # =========================================================================
+    # ACCESS RULES
+    # Must exist before ssid-profile references them.
+    # permit-all rule: clients on trusted VLAN can reach anything.
+    # =========================================================================
+
+    - name: Create permit-all access rules
+      ansible.builtin.uri:
+        url: "{{ _swarm_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          opcode: config
+          sid: "{{ _sid }}"
+          ip: "127.0.0.1"
+          refresh: "false"
+          cmd: "wlan access-rule {{ item.value.profile }}\n rule any any match any any any permit\n exit"
+        validate_certs: false
+        status_code: 200
+      loop: "{{ ssids | dict2items }}"
+      loop_control:
+        label: "access-rule {{ item.value.profile }}"
+      no_log: true
+
+    # =========================================================================
+    # SSID PROFILES
+    # In Aruba Instant standalone mode, the ssid-profile is the primary config
+    # object — the AP auto-creates a virtual AP from it.
+    # vlan sets the 802.1Q VLAN clients are bridged onto.
+    # opmode wpa2-psk-aes + wpa-passphrase = WPA2-Personal.
+    # type employee is the only valid option for PSK on Instant (not "personal").
+    # =========================================================================
+
+    - name: Configure SSID profiles
+      ansible.builtin.uri:
+        url: "{{ _swarm_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          opcode: config
+          sid: "{{ _sid }}"
+          ip: "127.0.0.1"
+          refresh: "false"
+          cmd: |
+            wlan ssid-profile {{ item.value.profile }}
+             essid {{ item.value.name }}
+             opmode wpa2-psk-aes
+             wpa-passphrase {{ vars[item.key + '_wifi_password'] }}
+             type employee
+             vlan {{ item.value.vlan }}
+             exit
+        validate_certs: false
+        status_code: 200
+      loop: "{{ ssids | dict2items }}"
+      loop_control:
+        label: "ssid-profile {{ item.value.profile }} → VLAN {{ item.value.vlan }}"
+      no_log: true
+
+    # =========================================================================
+    # CLIENT ISOLATION (IoT and guest only)
+    # Deny intra-VLAN bridging between wireless clients on the same SSID.
+    # =========================================================================
+
+    - name: Enable client isolation on IoT/guest SSIDs
+      ansible.builtin.uri:
+        url: "{{ _swarm_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          opcode: config
+          sid: "{{ _sid }}"
+          ip: "127.0.0.1"
+          refresh: "false"
+          cmd: "wlan ssid-profile {{ item.value.profile }}\n deny-inter-user-bridging\n exit"
+        validate_certs: false
+        status_code: 200
+      loop: "{{ ssids | dict2items | selectattr('value.client_isolation', 'equalto', true) | list }}"
+      loop_control:
+        label: "{{ item.value.profile }} — client isolation"
+
+    # =========================================================================
+    # COMMIT AND SAVE
+    # =========================================================================
+
+    - name: Commit apply
+      ansible.builtin.uri:
+        url: "{{ _swarm_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          opcode: config
+          sid: "{{ _sid }}"
+          ip: "127.0.0.1"
+          refresh: "false"
+          cmd: "commit apply"
+        validate_certs: false
+        status_code: 200
+
+    - name: Write memory
+      ansible.builtin.uri:
+        url: "{{ _swarm_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          opcode: config
+          sid: "{{ _sid }}"
+          ip: "127.0.0.1"
+          refresh: "false"
+          cmd: "write memory"
+        validate_certs: false
+        status_code: 200
+
+    # =========================================================================
+    # VERIFY via REST show-cmd
+    # =========================================================================
+
+    - name: REST login for verification
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:4343/rest/login"
+        method: POST
+        body_format: json
+        body:
+          user: "{{ ansible_user | default('admin') }}"
+          passwd: "{{ ap_admin_password }}"
+        validate_certs: false
+        status_code: 200
+      register: _rest_login
+      no_log: true
+
+    - name: Show active networks
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:4343/rest/show-cmd?cmd=show%20network&sid={{ _rest_login.json.sid }}&iap_ip_addr=127.0.0.1"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      register: _show_network
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          Instant AP configuration complete
+          VC: {{ ansible_host }}  ({{ inventory_hostname }})
+
+          SSIDs configured:
+          {% for s in ssids.values() %}
+            {{ s.name }}  →  VLAN {{ s.vlan }}  (bridge){% if s.client_isolation %}  [client isolated]{% endif %}
+
+          {% endfor %}
+
+          Active networks on AP:
+          {{ _show_network.json.get('Command output', '(none)') }}
+
+          VERIFY:
+            1. Connect to {{ ssids.trusted.name }} — should get 10.40.0.x IP
+            2. ping 8.8.8.8 — confirms routing + NAT through 9004
+          ============================================================

@@ -1,0 +1,19 @@
+---
+# playbooks/03_build_golden_template.yml
+#
+# Builds the Debian 13 golden cloud-init template on pve-01.
+# Idempotent — safe to re-run; skips the build if the template VMID
+# already exists.
+#
+# To force a rebuild from scratch:
+#   qm destroy 9000   (on pve-01, via SSH)
+#   then re-run this playbook
+#
+# Usage:
+#   ansible-playbook playbooks/03_build_golden_template.yml
+
+- name: Build the Debian 13 golden template
+  hosts: proxmox
+  become: true
+  roles:
+    - proxmox_golden_template

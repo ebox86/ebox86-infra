@@ -1,0 +1,23 @@
+---
+# playbooks/02_proxmox_acme_cloudflare.yml
+#
+# Registers Let's Encrypt + Cloudflare DNS-01 ACME plugin on pve-01 and
+# orders a real certificate for the node's web UI.
+#
+# Requires secrets/vault.yml to contain:
+#   cloudflare_api_token
+#   cloudflare_zone_id
+#
+# Usage:
+#   ansible-playbook playbooks/02_proxmox_acme_cloudflare.yml
+
+- name: Set up ACME/Let's Encrypt via Cloudflare DNS-01 on Proxmox
+  hosts: proxmox
+  become: true
+  vars_files:
+    - ../secrets/vault.yml
+  vars:
+    acme_email: "acme@ebox86.com"
+    acme_domain: "pve-01.ebox86.com"
+  roles:
+    - proxmox_acme_cloudflare

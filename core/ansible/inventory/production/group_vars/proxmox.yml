@@ -1,0 +1,25 @@
+---
+# inventory/production/group_vars/proxmox.yml
+# Non-secret Proxmox connection settings.
+# Secrets (api token, etc.) live in secrets/vault.yml — never here.
+
+proxmox_api_host: 10.0.0.10
+proxmox_node: pve-01
+
+# General default storage for ad-hoc VMs/containers (override per-VM
+# as needed). local-zfs is the default VM storage on rpool (NVMe).
+proxmox_storage: local-zfs
+proxmox_bridge: vmbr0
+
+template_vmid: 9000
+template_name: debian-13-golden
+template_image_url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+# Note: "latest" tracks the current Trixie point release automatically
+# (13.5.0 as of this writing) — no need to edit this URL on point upgrades.
+
+# Template lives on fastpool-storage (single-disk ZFS on the mSATA SSD)
+# rather than rpool/local-zfs — keeps the NVMe pool reserved for VMs
+# that need to be there, and the template is trivially rebuildable if
+# the mSATA disk ever fails (no redundancy on that pool).
+template_storage: fastpool-storage
+template_disk_size_gb: 20

@@ -1,0 +1,142 @@
+---
+# playbooks/33_tune_okd_control0_disk.yml
+#
+# Tunes okd-control-0's scsi0 disk for lower etcd WAL latency:
+#   1. cache=writeback   (applied previously, live, no restart needed)
+#   2. iothread=1 + scsihw=virtio-scsi-single  (NEW — requires a full VM
+#      stop/start to take effect, since it changes the virtual controller
+#      topology, not just a runtime disk parameter)
+#
+# Why: okd-control-0 is a VM on Proxmox (local-zfs / NVMe) while okd-worker-0
+# and okd-worker-1 are bare-metal HPE ML350 Gen10 servers with direct NVMe.
+# etcd's WAL does synchronous fsyncs; the virtualization + ZFS CoW overhead
+# makes every fsync slower than bare metal, causing raft consensus to lag
+# and producing "apply request took too long" / kube-apiserver gRPC
+# "operation was canceled" errors against 10.0.1.10:2379.
+#
+# cache=writeback (Proxmox-recommended for ZFS-backed storage) lets the host
+# page cache batch small WAL writes, cutting effective fsync latency.
+#
+# iothread=1 moves this disk's I/O off QEMU's single main loop into its own
+# thread, so disk I/O can no longer block vCPU/main-loop execution under
+# concurrent load. virtio-scsi-single is required to use iothread (each
+# disk gets its own controller instance). Gains are modest (~15% at low
+# queue depth per published QEMU/Proxmox benchmarks) but etcd's WAL pattern
+# — small, frequent, synchronous writes — is exactly that low-queue-depth,
+# latency-sensitive case, so this is a real complementary fix, not a
+# placebo.
+#
+# Verified minimum control-plane RAM (Red Hat OpenShift/OKD docs) is 16GB;
+# control-0 is currently at 11240MB, already below that floor — so unlike
+# disk tuning, memory is NOT a place to cut further while resource
+# constrained on pve-01.
+#
+# Idempotent — skips disk changes if cache=writeback and iothread=1 are
+# already set, and skips the controller change if scsihw is already
+# virtio-scsi-single.
+#
+# IMPORTANT: the iothread/scsihw change only takes effect after the VM is
+# fully stopped and started (qm shutdown / qm start) — not a guest reboot.
+# Apply this while control-0 is already down for maintenance.
+#
+# Usage:
+#   ansible-playbook -i inventory/production/hosts.yml \
+#     playbooks/33_tune_okd_control0_disk.yml
+
+- name: Tune okd-control-0 disk (cache, iothread, scsihw) for lower etcd WAL latency
+  hosts: proxmox
+  become: true
+
+  vars:
+    control0_vmid: 200
+    control0_disk: scsi0
+
+  tasks:
+
+    - name: Read current config from Proxmox
+      ansible.builtin.command: qm config {{ control0_vmid }}
+      register: vm_config
+      changed_when: false
+
+    - name: Parse current scsi0 line
+      ansible.builtin.set_fact:
+        scsi0_line: >-
+          {{ vm_config.stdout_lines
+             | select('match', '^scsi0:')
+             | first }}
+
+    - name: Parse current scsihw line
+      ansible.builtin.set_fact:
+        scsihw_line: >-
+          {{ (vm_config.stdout_lines
+              | select('match', '^scsihw:')
+              | list
+              | default(['scsihw: virtio-scsi-pci'], true))
+             | first }}
+
+    - name: Show current disk settings
+      ansible.builtin.debug:
+        msg:
+          - "Current scsi0:  {{ scsi0_line }}"
+          - "Current scsihw: {{ scsihw_line }}"
+
+    - name: Build new scsi0 value (ensure cache=writeback and iothread=1, no duplicates)
+      ansible.builtin.set_fact:
+        scsi0_value: >-
+          {{ (scsi0_line
+              | regex_replace('^scsi0: ', '')
+              | regex_replace(',cache=[^,]+', '')
+              | regex_replace(',iothread=[^,]+', '')) }},cache=writeback,iothread=1
+
+    - name: Apply new scsi0 disk settings (live, no reboot needed)
+      ansible.builtin.command:
+        argv:
+          - qm
+          - set
+          - "{{ control0_vmid }}"
+          - "--{{ control0_disk }}"
+          - "{{ scsi0_value }}"
+      register: qm_set_disk_result
+      changed_when: qm_set_disk_result.rc == 0
+      when: "'cache=writeback' not in scsi0_line or 'iothread=1' not in scsi0_line"
+
+    - name: Apply virtio-scsi-single controller (requires VM stop/start to take effect)
+      ansible.builtin.command:
+        argv:
+          - qm
+          - set
+          - "{{ control0_vmid }}"
+          - --scsihw
+          - virtio-scsi-single
+      register: qm_set_scsihw_result
+      changed_when: qm_set_scsihw_result.rc == 0
+      when: "'virtio-scsi-single' not in scsihw_line"
+
+    - name: Verify updated config
+      ansible.builtin.command: qm config {{ control0_vmid }}
+      register: vm_config_after
+      changed_when: false
+
+    - name: Show updated disk settings
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Updated scsi0:  {{
+              vm_config_after.stdout_lines
+              | select('match', '^scsi0:')
+              | first
+            }}
+          - >-
+            Updated scsihw: {{
+              vm_config_after.stdout_lines
+              | select('match', '^scsihw:')
+              | first
+            }}
+
+    - name: Reminder if VM is running
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: scsihw/iothread changes only take effect after a full
+          'qm shutdown {{ control0_vmid }}' + 'qm start {{ control0_vmid }}'
+          — a guest-level reboot is not sufficient.
+      when: "'virtio-scsi-single' not in scsihw_line"

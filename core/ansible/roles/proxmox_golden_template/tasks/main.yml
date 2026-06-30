@@ -1,0 +1,106 @@
+---
+# roles/proxmox_golden_template/tasks/main.yml
+#
+# Builds the Debian 13 (Trixie) golden cloud-init template that every VM
+# in the homelab gets cloned from. Idempotent: skips download/customize/
+# create steps if the template VMID already exists as a template.
+#
+# Required vars (see group_vars/proxmox.yml):
+#   template_vmid, template_name, template_image_url
+#   template_storage      - Proxmox storage ID for the template's disk
+#   template_disk_size_gb - base disk size in GB
+# Uses q35 + OVMF for modern Linux VM defaults. Secure Boot keys are not
+# pre-enrolled to keep Debian cloud image boot behavior simple.
+
+- name: Check if the template VM already exists
+  ansible.builtin.command: qm status {{ template_vmid }}
+  register: template_status_check
+  changed_when: false
+  failed_when: false
+
+- name: Set fact for whether template already exists
+  ansible.builtin.set_fact:
+    template_already_exists: "{{ template_status_check.rc == 0 }}"
+
+- name: Download Debian 13 genericcloud image
+  ansible.builtin.get_url:
+    url: "{{ template_image_url }}"
+    dest: "/var/lib/vz/template/iso/debian-13-genericcloud-amd64.qcow2"
+    mode: '0644'
+  when: not template_already_exists
+
+- name: Install qemu-guest-agent into the image offline (virt-customize)
+  ansible.builtin.command: >
+    virt-customize -a /var/lib/vz/template/iso/debian-13-genericcloud-amd64.qcow2
+    --install qemu-guest-agent
+    --run-command 'systemctl enable qemu-guest-agent'
+  when: not template_already_exists
+
+- name: Create base VM shell for the template
+  ansible.builtin.command: >
+    qm create {{ template_vmid }}
+    --name {{ template_name }}
+    --memory 2048 --cores 2
+    --machine q35
+    --bios ovmf
+    --net0 virtio,bridge={{ proxmox_bridge }}
+    --scsihw virtio-scsi-pci
+    --ostype l26
+    --agent enabled=1
+  when: not template_already_exists
+
+- name: Import the customized disk into the template VM
+  ansible.builtin.command: >
+    qm importdisk {{ template_vmid }}
+    /var/lib/vz/template/iso/debian-13-genericcloud-amd64.qcow2
+    {{ template_storage }}
+  when: not template_already_exists
+
+- name: Attach imported disk as scsi0
+  ansible.builtin.command: >
+    qm set {{ template_vmid }}
+    --scsi0 {{ template_storage }}:vm-{{ template_vmid }}-disk-0
+  when: not template_already_exists
+
+- name: Attach OVMF EFI disk
+  ansible.builtin.command: >
+    qm set {{ template_vmid }}
+    --efidisk0 {{ template_storage }}:0,efitype=4m,pre-enrolled-keys=0
+  when: not template_already_exists
+
+- name: Attach cloud-init drive
+  ansible.builtin.command: >
+    qm set {{ template_vmid }}
+    --ide2 {{ template_storage }}:cloudinit
+  when: not template_already_exists
+
+- name: Set boot order and serial console
+  ansible.builtin.command: >
+    qm set {{ template_vmid }}
+    --boot order=scsi0
+    --serial0 socket --vga serial0
+  when: not template_already_exists
+
+- name: Resize disk to base template size
+  ansible.builtin.command: >
+    qm resize {{ template_vmid }} scsi0 {{ template_disk_size_gb }}G
+  when: not template_already_exists
+
+- name: Convert VM to a Proxmox template
+  ansible.builtin.command: "qm template {{ template_vmid }}"
+  when: not template_already_exists
+
+- name: Inform user the template is ready
+  ansible.builtin.debug:
+    msg: >
+      Template '{{ template_name }}' (VMID {{ template_vmid }}) is ready
+      on storage '{{ template_storage }}'. Clone it to create new VMs.
+  when: not template_already_exists
+
+- name: Inform user the template already existed (no changes made)
+  ansible.builtin.debug:
+    msg: >
+      Template VMID {{ template_vmid }} already exists — skipped build.
+      To rebuild from scratch: qm destroy {{ template_vmid }} first,
+      then re-run this playbook.
+  when: template_already_exists

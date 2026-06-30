@@ -1,0 +1,54 @@
+---
+# playbooks/22_configure_cloudflare_rules.yml
+#
+# Configures Cloudflare Transform Rules for the ebox86.com zone.
+#
+# Currently manages:
+#   - Response header rule: adds "Cache-Control: no-transform" for iLO
+#     management hostnames so Cloudflare does not inject analytics/performance
+#     scripts that break the iLO web UI (blocked by iLO's own CSP).
+#
+# Requires secrets/vault.yml to contain:
+#   cloudflare_api_token   — API token with Zone.Rules:Edit permission
+#   cloudflare_zone_id     — Zone ID for ebox86.com
+#
+# Usage:
+#   ansible-playbook playbooks/22_configure_cloudflare_rules.yml
+
+- name: Configure Cloudflare Transform Rules for ebox86.com
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../secrets/vault.yml
+    - ../vars/network_topology.yml
+
+  tasks:
+
+    - name: Set iLO no-transform response header rule via Cloudflare API
+      ansible.builtin.uri:
+        url: "https://api.cloudflare.com/client/v4/zones/{{ cloudflare_zone_id }}/rulesets/phases/http_response_headers_transform/entrypoint"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ cloudflare_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          rules:
+            - description: "Disable Cloudflare script injection on iLO management interfaces"
+              expression: >-
+                (http.host in {"{{ ilo_hosts.pve_01_ilo.hostname }}.{{ search_domain }}"
+                               "{{ ilo_hosts.ml350_01_ilo.hostname }}.{{ search_domain }}"
+                               "{{ ilo_hosts.ml350_02_ilo.hostname }}.{{ search_domain }}"})
+              action: rewrite
+              action_parameters:
+                headers:
+                  Cache-Control:
+                    operation: set
+                    value: "no-transform"
+        status_code: [200, 201]
+      register: cf_rule_result
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "Transform rule applied. Rule ID: {{ cf_rule_result.json.result.rules[0].id | default('unknown') }}"

@@ -1,0 +1,231 @@
+---
+# playbooks/61_configure_switch.yml
+#
+# Configures Aruba CX 6000 (cx6000-01) with VLANs, port assignments,
+# STP root priority, NTP, and PoE for the AP mesh portal port.
+#
+# Two plays — required because aoscx_config/aoscx_command use SSH (network_cli)
+# while the resource modules (aoscx_vlan, aoscx_l2_interface, etc.) use the
+# REST API (httpapi). A single play cannot mix the two connection types.
+# The SSH play overrides ansible_connection; the REST play uses the inventory
+# default (httpapi).
+# Reference: https://github.com/aruba/aoscx-ansible-role#using-both-rest-api-and-sshcli-modules-on-a-host
+#
+# Prerequisites:
+#   1. Install collections:  ansible-galaxy collection install -r requirements.yml
+#   2. Add to secrets/vault.yml:
+#        switch_admin_password   — CX 6000 admin password
+#   3. Physical re-patch complete (see port layout comment in vars/network_vlans.yml)
+#
+# Port 1/1/15 (SFP — future 9004 LAN) is configured as trunk but will
+# have no link until an SFP module + cable are installed.
+# Port 1/1/16 (spare SFP) is left untouched.
+#
+# Usage:
+#   ansible-playbook playbooks/61_configure_switch.yml --vault-password-file ~/.vault_pass.txt
+
+# =============================================================================
+# PLAY 1 — SSH/CLI  (hostname, STP, NTP)
+# aoscx_config requires network_cli (SSH), not httpapi
+# =============================================================================
+
+- name: Configure Aruba CX 6000 — system settings (SSH)
+  hosts: cx_switches
+  gather_facts: false
+  tags: [ssh]
+  vars_files:
+    - ../vars/network_vlans.yml
+    - ../secrets/vault.yml
+  vars:
+    ansible_connection: network_cli
+    ansible_network_os: arubanetworks.aoscx.aoscx
+    ansible_password: "{{ switch_admin_password }}"
+    ntp_servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+
+  tasks:
+
+    - name: Set switch hostname
+      arubanetworks.aoscx.aoscx_config:
+        lines:
+          - hostname sw-core-01
+
+    - name: Set STP bridge priority (make CX 6000 root, displacing 9004)
+      arubanetworks.aoscx.aoscx_config:
+        lines:
+          - spanning-tree priority 4096
+
+    - name: Configure NTP servers
+      arubanetworks.aoscx.aoscx_config:
+        lines: "{{ ntp_servers | map('regex_replace', '^(.*)$', 'ntp server \\1') | list }}"
+
+    - name: Enable ip routing (required to configure VLAN 1 management SVI)
+      arubanetworks.aoscx.aoscx_config:
+        lines:
+          - ip routing
+
+    - name: Configure VLAN 1 SVI (switch management 10.0.0.250/24)
+      arubanetworks.aoscx.aoscx_config:
+        parents:
+          - interface vlan 1
+        lines:
+          - ip address 10.0.0.250/24
+          - no shutdown
+
+    - name: Write memory
+      arubanetworks.aoscx.aoscx_config:
+        lines:
+          - write memory
+
+# =============================================================================
+# PLAY 2 — REST API/httpapi  (VLANs, ports, PoE)
+# Resource modules use httpapi from inventory — no ansible_connection override
+# =============================================================================
+
+- name: Configure Aruba CX 6000 — VLANs and port assignments (REST API)
+  hosts: cx_switches
+  gather_facts: false
+  tags: [rest]
+  vars_files:
+    - ../vars/network_vlans.yml
+    - ../secrets/vault.yml
+  vars:
+    ansible_password: "{{ switch_admin_password }}"
+
+  tasks:
+
+    - name: Create VLANs
+      arubanetworks.aoscx.aoscx_vlan:
+        vlan_id: "{{ item.id }}"
+        name: "{{ item.name }}"
+        description: "{{ item.description }}"
+        state: create
+      loop: "{{ vlans }}"
+      loop_control:
+        label: "VLAN {{ item.id }} — {{ item.name }}"
+        pause: 8
+
+    - name: Pause — let switch recover HTTPS connections
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Configure trunk ports
+      arubanetworks.aoscx.aoscx_l2_interface:
+        interface: "{{ item.interface }}"
+        vlan_mode: trunk
+        native_vlan_id: "{{ item.native_vlan }}"
+        vlan_trunks: "{{ item.allowed_vlans | map('string') | list }}"
+        state: create
+      loop: "{{ cx6000_trunk_ports }}"
+      loop_control:
+        label: "{{ item.interface }} trunk (native {{ item.native_vlan }})"
+        pause: 8
+
+    - name: Pause — let switch recover HTTPS connections
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Configure access ports
+      arubanetworks.aoscx.aoscx_l2_interface:
+        interface: "{{ item.interface }}"
+        vlan_mode: access
+        vlan_access: "{{ item.vlan }}"
+        state: create
+      loop: "{{ cx6000_access_ports }}"
+      loop_control:
+        label: "{{ item.interface }} access VLAN {{ item.vlan }}"
+        pause: 8
+      # Skip port 12 — it stays on VLAN 1 (management lifeline) until
+      # 9004 inter-VLAN routing is verified and GE0/0/2 direct Mac link is live.
+      when: item.interface != '1/1/12'
+
+    - name: Pause — let switch recover HTTPS connections
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Set interface descriptions — trunk ports
+      arubanetworks.aoscx.aoscx_interface:
+        name: "{{ item.interface }}"
+        description: "{{ item.description }}"
+        state: update
+      loop: "{{ cx6000_trunk_ports }}"
+      loop_control:
+        label: "{{ item.interface }}"
+        pause: 8
+
+    - name: Set interface descriptions — access ports
+      arubanetworks.aoscx.aoscx_interface:
+        name: "{{ item.interface }}"
+        description: "{{ item.description }}"
+        state: update
+      loop: "{{ cx6000_access_ports }}"
+      loop_control:
+        label: "{{ item.interface }}"
+        pause: 8
+
+    - name: Enable jumbo frames (MTU 9198) on VLAN 20 storage ports
+      # Covers both ends of the NFS path on the switch:
+      #   1/1/5 — pve-01 VM data trunk (VLAN 20 egress to NFS server)
+      #   1/1/6 — ml350-01 storage NIC
+      #   1/1/7 — ml350-02 storage NIC
+      arubanetworks.aoscx.aoscx_interface:
+        name: "{{ item }}"
+        mtu: 9198
+        state: update
+      loop:
+        - "1/1/5"
+        - "1/1/6"
+        - "1/1/7"
+      loop_control:
+        label: "MTU 9198 on {{ item }}"
+        pause: 8
+
+    - name: Enable PoE on AP mesh portal port (1/1/10)
+      arubanetworks.aoscx.aoscx_poe:
+        interface: "1/1/10"
+        enable: true
+        priority: high
+        allocate_by_method: class
+        state: create
+
+    - name: Write memory (persist REST API changes to startup-config)
+      arubanetworks.aoscx.aoscx_config:
+        lines:
+          - write memory
+      vars:
+        ansible_connection: network_cli
+        ansible_network_os: arubanetworks.aoscx.aoscx
+        ansible_password: "{{ switch_admin_password }}"
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg: |
+          CX 6000 configured — pure L2 switch (9004 owns all L3/DHCP).
+
+          Hostname: sw-core-01
+          STP bridge priority set to 4096 — CX 6000 is now root.
+
+          VLANs created: {{ vlans | map(attribute='id') | list | join(', ') }}
+
+          Trunk ports:
+          {% for p in cx6000_trunk_ports %}
+            {{ p.interface }}  native={{ p.native_vlan }}  allowed={{ p.allowed_vlans | join(',') }}  ({{ p.description }})
+          {% endfor %}
+
+          Access ports:
+          {% for p in cx6000_access_ports %}
+            {{ p.interface }}  VLAN {{ p.vlan }}  ({{ p.description }})
+          {% endfor %}
+
+          PoE enabled on 1/1/10 (505 AP-1 mesh portal).
+          MTU 9198 (jumbo frames) on 1/1/5, 1/1/6, 1/1/7 (VLAN 20 NFS path).
+
+          ACTION REQUIRED — also set MTU 9000 on server NICs at OS level:
+            pve-01:   GbE 0/1 (VM data NIC / VLAN 20 bridge)
+            ml350-01: GbE 0/1 (storage NIC)
+            ml350-02: GbE 0/1 (storage NIC)
+
+          NOTE: Port 1/1/13 is the 9004 trunk uplink (native VLAN 1, all LAN VLANs tagged).
+          NOTE: Port 1/1/15 (9004 SFP) has no link until SFP module is installed.
+          NOTE: Port 1/1/14 is the in-wall switch uplink (apt wall outlets, VLAN 40).

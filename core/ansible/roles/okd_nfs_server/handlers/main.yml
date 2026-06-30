@@ -1,0 +1,3 @@
+---
+- name: reload nfs server
+  ansible.builtin.shell: exportfs -ra
