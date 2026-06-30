@@ -13,7 +13,7 @@ spec:
 
   sourceRepos:
     - https://github.com/ebox86/ebox86-infra.git
-    - https://bitnami-labs.github.io/sealed-secrets
+    - https://bitnami.github.io/sealed-secrets
     - https://grafana.github.io/helm-charts
     - https://prometheus-community.github.io/helm-charts
     - https://metallb.github.io/metallb
