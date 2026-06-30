@@ -24,14 +24,20 @@ spec:
                   args:
                     ignorePvcPods: true
                     evictLocalStoragePods: false
+                - name: RemoveDuplicates
+                - name: RemovePodsViolatingInterPodAntiAffinity
+                - name: RemovePodsViolatingNodeAffinity
+                  args:
+                    nodeAffinityType:
+                      - requiredDuringSchedulingIgnoredDuringExecution
               plugins:
                 balance:
                   enabled:
                     - RemoveDuplicates
-                    - LowNodeUtilization
                 deschedule:
                   enabled:
                     - RemovePodsViolatingInterPodAntiAffinity
+                    - RemovePodsViolatingNodeAffinity
   destination:
     server: https://kubernetes.default.svc
     namespace: kube-system
