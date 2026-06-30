@@ -1,0 +1,12 @@
+---
+# LoadBalancer IP pool — carved from the OKD VLAN 30 subnet (10.0.1.0/24).
+# Range 10.0.1.210-230 avoids the cluster VIP (10.0.1.200) and node IPs.
+# Adjust range here if you need more or fewer addresses.
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: lab-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 10.0.1.210-10.0.1.230

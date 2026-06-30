@@ -1,0 +1,43 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: descheduler
+  namespace: openshift-gitops
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab.ebox86.com
+  source:
+    repoURL: https://kubernetes-sigs.github.io/descheduler
+    chart: descheduler
+    targetRevision: "*"
+    helm:
+      values: |
+        kind: CronJob
+        schedule: "*/30 * * * *"
+        deschedulerPolicy:
+          profiles:
+            - name: default
+              pluginConfig:
+                - name: DefaultEvictor
+                  args:
+                    ignorePvcPods: true
+                    evictLocalStoragePods: false
+              plugins:
+                balance:
+                  enabled:
+                    - RemoveDuplicates
+                    - LowNodeUtilization
+                deschedule:
+                  enabled:
+                    - RemovePodsViolatingInterPodAntiAffinity
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

@@ -1,0 +1,26 @@
+---
+# Applies IPAddressPool + L2Advertisement after MetalLB controller is up.
+# SkipDryRunOnMissingResource handles the case where CRDs aren't registered yet
+# on first sync — ArgoCD will retry and converge once metallb app is ready.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: metallb-config
+  namespace: openshift-gitops
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab.ebox86.com
+  source:
+    repoURL: https://github.com/ebox86/ebox86-infra.git
+    targetRevision: main
+    path: k8s/metallb
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: metallb-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - SkipDryRunOnMissingResource=true

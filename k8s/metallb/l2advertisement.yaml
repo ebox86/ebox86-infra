@@ -1,0 +1,11 @@
+---
+# L2 mode — metallb-speaker handles ARP on VLAN 30.
+# Works without BGP; relies on gratuitous ARP for IP failover between speakers.
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: lab-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - lab-pool

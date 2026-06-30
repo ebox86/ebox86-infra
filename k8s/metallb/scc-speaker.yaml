@@ -1,0 +1,16 @@
+---
+# MetalLB speaker pods need privileged SCC on OKD to send raw ARP packets.
+# This ClusterRoleBinding can be applied before the SA exists — it takes effect
+# as soon as the metallb Helm release creates the speaker ServiceAccount.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metallb-speaker-privileged-scc
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+  - kind: ServiceAccount
+    name: metallb-speaker
+    namespace: metallb-system

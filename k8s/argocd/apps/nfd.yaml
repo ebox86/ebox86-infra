@@ -1,0 +1,31 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nfd
+  namespace: openshift-gitops
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: lab.ebox86.com
+  source:
+    repoURL: https://kubernetes-sigs.github.io/node-feature-discovery/charts
+    chart: node-feature-discovery
+    targetRevision: "*"
+    helm:
+      values: |
+        worker:
+          tolerations:
+            - key: node-role.kubernetes.io/master
+              effect: NoSchedule
+              operator: Exists
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: openshift-nfd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true

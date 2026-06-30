@@ -76,7 +76,7 @@ spec:
             datasources:
               - name: Prometheus (Infra)
                 type: prometheus
-                url: http://prometheus-infra.monitoring.svc.cluster.local:9090
+                url: http://prometheus-infra-prometheus.monitoring.svc.cluster.local:9090
                 access: proxy
                 isDefault: true
                 jsonData:
