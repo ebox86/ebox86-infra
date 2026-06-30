@@ -1,10 +1,10 @@
 ---
-# AppProject scoping all homelab workloads.
+# AppProject scoping all lab.ebox86.com workloads.
 # Limits source repos and destination clusters ArgoCD apps can target.
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
-  name: homelab
+  name: lab.ebox86.com
   namespace: openshift-gitops
   finalizers:
     - resources-finalizer.argocd.argoproj.io
@@ -15,16 +15,18 @@ spec:
     - https://github.com/ebox86/ebox86-infra.git
     - https://grafana.github.io/helm-charts
     - https://prometheus-community.github.io/helm-charts
+    - https://metallb.github.io/metallb
+    - https://kubernetes-sigs.github.io/node-feature-discovery/charts
+    - https://kubernetes-sigs.github.io/descheduler
+    - https://grafana.github.io/loki-helm-chart
 
   destinations:
     - server: https://kubernetes.default.svc
-      namespace: monitoring
-    - server: https://kubernetes.default.svc
-      namespace: logging
+      namespace: "*"
 
   clusterResourceWhitelist:
-    - group: ""
-      kind: Namespace
+    - group: "*"
+      kind: "*"
 
   namespaceResourceWhitelist:
     - group: "*"
