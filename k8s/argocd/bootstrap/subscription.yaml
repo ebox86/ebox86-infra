@@ -1,0 +1,21 @@
+---
+# Install argocd-operator (community) via OLM — replaces redhat openshift-gitops-operator
+# which does not exist on OKD (redhat-operators catalog is not available).
+#
+# Apply once: oc apply -f k8s/argocd/bootstrap/subscription.yaml
+#
+# After ~2 minutes ArgoCD is available at:
+#   https://argocd-server-openshift-gitops.apps.lab.ebox86.com
+# Retrieve the initial admin password:
+#   oc get secret argocd-cluster -n openshift-gitops \
+#     -o jsonpath='{.data.admin\.password}' | base64 -d
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: argocd-operator
+  namespace: openshift-operators
+spec:
+  channel: alpha
+  name: argocd-operator
+  source: community-operators
+  sourceNamespace: openshift-marketplace

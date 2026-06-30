@@ -1,0 +1,130 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: grafana
+  namespace: openshift-gitops
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: homelab
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: grafana
+    targetRevision: "8.*"
+    helm:
+      values: |
+        replicas: 1
+
+        # Admin credentials — create the secret before syncing:
+        #   oc create secret generic grafana-admin \
+        #     -n monitoring \
+        #     --from-literal=admin-user=admin \
+        #     --from-literal=admin-password=<password>
+        admin:
+          existingSecret: grafana-admin
+          userKey: admin-user
+          passwordKey: admin-password
+
+        persistence:
+          enabled: true
+          storageClassName: nfs-client
+          size: 5Gi
+          accessModes:
+            - ReadWriteMany
+
+        # OKD: run as any UID via anyuid SCC
+        securityContext:
+          runAsNonRoot: false
+          runAsUser: 472
+        containerSecurityContext:
+          runAsUser: 472
+
+        serviceAccount:
+          create: true
+          name: grafana
+
+        # Expose via OKD Route (OKD auto-creates Route from Ingress)
+        ingress:
+          enabled: true
+          ingressClassName: ""
+          annotations:
+            route.openshift.io/termination: edge
+          hosts:
+            - grafana.apps.lab.ebox86.com
+          tls:
+            - hosts:
+                - grafana.apps.lab.ebox86.com
+
+        # Sidecar watches ConfigMaps labelled grafana_dashboard=1
+        # and auto-imports them as dashboards
+        sidecar:
+          dashboards:
+            enabled: true
+            label: grafana_dashboard
+            labelValue: "1"
+            searchNamespace: monitoring
+          datasources:
+            enabled: true
+            label: grafana_datasource
+            labelValue: "1"
+            searchNamespace: monitoring
+
+        datasources:
+          datasources.yaml:
+            apiVersion: 1
+            datasources:
+              - name: Prometheus (Infra)
+                type: prometheus
+                url: http://prometheus-infra.monitoring.svc.cluster.local:9090
+                access: proxy
+                isDefault: true
+                jsonData:
+                  timeInterval: 60s
+
+              - name: Thanos (OKD)
+                type: prometheus
+                url: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+                access: proxy
+                jsonData:
+                  httpHeaderName1: Authorization
+                  tlsSkipVerify: true
+                secureJsonData:
+                  httpHeaderValue1: "Bearer $__env{THANOS_TOKEN}"
+
+        dashboardProviders:
+          dashboardproviders.yaml:
+            apiVersion: 1
+            providers:
+              - name: default
+                orgId: 1
+                folder: ""
+                type: file
+                disableDeletion: false
+                editable: true
+                options:
+                  path: /var/lib/grafana/dashboards/default
+
+        # Pre-load community dashboards by ID
+        dashboards:
+          default:
+            node-exporter-full:
+              gnetId: 1860
+              revision: 37
+              datasource: "Prometheus (Infra)"
+            okd-cluster-overview:
+              gnetId: 3119
+              revision: 2
+              datasource: "Thanos (OKD)"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true
