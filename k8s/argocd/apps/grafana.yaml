@@ -33,12 +33,17 @@ spec:
           accessModes:
             - ReadWriteMany
 
-        # OKD: run as any UID via anyuid SCC
-        securityContext:
-          runAsNonRoot: false
-          runAsUser: 472
-        containerSecurityContext:
-          runAsUser: 472
+        # OKD: disable initChownData (needs CHOWN capability, blocked by OKD SCCs)
+        # and clear seccomp annotations the chart sets by default.
+        # anyuid SCC lets grafana run as UID 472; OKD auto-assigns if left empty.
+        initChownData:
+          enabled: false
+
+        securityContext: {}
+        containerSecurityContext: {}
+
+        # Clear per-container seccomp annotations grafana chart adds by default
+        podAnnotations: {}
 
         serviceAccount:
           create: true
@@ -106,10 +111,6 @@ spec:
               gnetId: 1860
               revision: 37
               datasource: "Prometheus (Infra)"
-            okd-cluster-overview:
-              gnetId: 3119
-              revision: 2
-              datasource: "Thanos (OKD)"
 
   destination:
     server: https://kubernetes.default.svc
