@@ -1,0 +1,15 @@
+---
+# Grafana runs as UID 472 with init-chown-data as root; both are outside OKD's
+# default UID range. anyuid SCC allows these non-standard UIDs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: grafana-anyuid-scc
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+subjects:
+  - kind: ServiceAccount
+    name: grafana
+    namespace: monitoring
