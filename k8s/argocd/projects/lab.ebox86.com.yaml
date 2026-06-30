@@ -9,7 +9,7 @@ metadata:
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
-  description: Homelab workloads
+  description: lab.ebox86.com workloads
 
   sourceRepos:
     - https://github.com/ebox86/ebox86-infra.git

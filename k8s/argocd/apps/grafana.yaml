@@ -82,15 +82,9 @@ spec:
                 jsonData:
                   timeInterval: 60s
 
-              - name: Thanos (OKD)
-                type: prometheus
-                url: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
-                access: proxy
-                jsonData:
-                  httpHeaderName1: Authorization
-                  tlsSkipVerify: true
-                secureJsonData:
-                  httpHeaderValue1: "Bearer $__env{THANOS_TOKEN}"
+              # Thanos (OKD) datasource omitted — requires a service account
+              # token mounted as THANOS_TOKEN env var in the Grafana pod.
+              # Add back once a grafana SA token is configured.
 
         dashboardProviders:
           dashboardproviders.yaml:

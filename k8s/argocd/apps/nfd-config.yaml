@@ -2,25 +2,20 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: sealed-secrets
+  name: nfd-config
   namespace: openshift-gitops
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
   project: lab.ebox86.com
   source:
-    repoURL: https://bitnami-labs.github.io/sealed-secrets
-    chart: sealed-secrets
-    targetRevision: "2.*"
-    helm:
-      values: |
-        fullnameOverride: sealed-secrets-controller
+    repoURL: https://github.com/ebox86/ebox86-infra.git
+    targetRevision: main
+    path: k8s/nfd
   destination:
     server: https://kubernetes.default.svc
-    namespace: kube-system
+    namespace: openshift-nfd
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
-    syncOptions:
-      - ServerSideApply=true
